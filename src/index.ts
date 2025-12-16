@@ -669,3 +669,356 @@ app.get("/blocks/:id", async (req, res) => {
     client.release();
   }
 });
+
+/* -----------------------
+   Profiles (V1)
+------------------------ */
+
+// Create/update profile (handle setup + avatar/style)
+// POST /profile
+// Body: { userId, handle?, avatarUrl?, bgStyle? }
+app.post("/profile", async (req, res) => {
+  const userId = String(req.body?.userId || "").trim();
+  const handle = req.body?.handle ? String(req.body.handle).trim().replace(/^@/, "") : null;
+  const avatarUrl = req.body?.avatarUrl ? String(req.body.avatarUrl).trim() : null;
+  const bgStyle = req.body?.bgStyle ? String(req.body.bgStyle).trim() : null;
+
+  if (!userId) return res.status(400).json({ error: "userId is required" });
+
+  const client = await pool.connect();
+  try {
+    // If handle is being set, enforce minimal formatting
+    if (handle && !/^[a-zA-Z0-9_]{2,24}$/.test(handle)) {
+      return res.status(400).json({ error: "handle must be 2-24 chars of letters, numbers, underscore" });
+    }
+
+    const q = await client.query(
+      `
+      insert into user_profiles (user_id, handle, avatar_url, bg_style, updated_at)
+      values (
+        $1,
+        coalesce($2, (select handle from user_profiles where user_id = $1)),
+        coalesce($3, (select avatar_url from user_profiles where user_id = $1)),
+        coalesce($4, (select bg_style from user_profiles where user_id = $1), 'default'),
+        now()
+      )
+      on conflict (user_id) do update set
+        handle = coalesce(excluded.handle, user_profiles.handle),
+        avatar_url = coalesce(excluded.avatar_url, user_profiles.avatar_url),
+        bg_style = coalesce(excluded.bg_style, user_profiles.bg_style),
+        updated_at = now()
+      returning user_id, handle, avatar_url, bg_style
+      `,
+      [userId, handle, avatarUrl, bgStyle]
+    );
+
+    res.json(q.rows[0]);
+  } catch (err: any) {
+    // Unique handle violation => friendly message
+    if (String(err?.code) === "23505") {
+      return res.status(409).json({ error: "handle already taken" });
+    }
+    console.error(err);
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /profile/@:handle  (supports short URL patterns)
+app.get("/profile/@:handle", async (req, res) => {
+  const handle = String(req.params.handle || "").trim().replace(/^@/, "");
+  if (!handle) return res.status(400).json({ error: "handle is required" });
+
+  const client = await pool.connect();
+  try {
+    const p = await client.query(
+      `select user_id, handle, avatar_url, bg_style
+       from user_profiles
+       where handle = $1
+       limit 1`,
+      [handle]
+    );
+    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
+    const userId = p.rows[0].user_id as string;
+
+    // Total likes across the user's public posted blocks (since likes only exist there in v1)
+    const likes = await client.query(
+      `
+      select count(*)::int as total_likes
+      from block_likes bl
+      join blocks b on b.id = bl.block_id
+      where b.owner_id = $1
+        and b.is_posted = true
+        and b.visibility = 'public'
+      `,
+      [userId]
+    );
+
+    res.json({
+      ...p.rows[0],
+      total_likes: likes.rows[0].total_likes
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /profile/:userId/public  => public posted blocks newest-first
+app.get("/profile/:userId/public", async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
+  const before = req.query.before ? String(req.query.before) : null;
+
+  const client = await pool.connect();
+  try {
+    const params: any[] = [userId];
+    let where = `where b.owner_id = $1 and b.is_posted = true and b.visibility = 'public'`;
+
+    if (before) {
+      params.push(before);
+      where += ` and coalesce(b.posted_at, b.created_at) < $${params.length}`;
+    }
+
+    params.push(limit);
+
+    const q = await client.query(
+      `
+      select
+        b.id,
+        b.owner_id,
+        b.title,
+        b.content,
+        b.visibility,
+        b.is_posted,
+        b.is_pinned,
+        b.pinned_order,
+        coalesce(b.posted_at, b.created_at) as feed_time,
+        coalesce(lc.like_count, 0)::int as like_count,
+        coalesce(rc.remix_count, 0)::int as remix_count
+      from blocks b
+      left join (
+        select block_id, count(*)::int as like_count
+        from block_likes
+        group by block_id
+      ) lc on lc.block_id = b.id
+      left join (
+        select parent_block_id as block_id, count(*)::int as remix_count
+        from remix_edges
+        group by parent_block_id
+      ) rc on rc.block_id = b.id
+      ${where}
+      order by feed_time desc
+      limit $${params.length}
+      `,
+      params
+    );
+
+    res.json({ items: q.rows });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /profile/:userId/private?viewerId=...
+// V1 rule: only owner can see private tab (friends later)
+app.get("/profile/:userId/private", async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const viewerId = String(req.query.viewerId || "").trim();
+  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
+  const before = req.query.before ? String(req.query.before) : null;
+
+  if (!viewerId) return res.status(400).json({ error: "viewerId is required" });
+  if (viewerId !== userId) return res.status(403).json({ error: "private tab not available (friends coming later)" });
+
+  const client = await pool.connect();
+  try {
+    const params: any[] = [userId];
+    let where = `where b.owner_id = $1 and b.is_posted = true and b.visibility = 'private'`;
+
+    if (before) {
+      params.push(before);
+      where += ` and coalesce(b.posted_at, b.created_at) < $${params.length}`;
+    }
+
+    params.push(limit);
+
+    const q = await client.query(
+      `
+      select
+        b.id,
+        b.owner_id,
+        b.title,
+        b.content,
+        b.visibility,
+        b.is_posted,
+        b.is_pinned,
+        b.pinned_order,
+        coalesce(b.posted_at, b.created_at) as feed_time
+      from blocks b
+      ${where}
+      order by feed_time desc
+      limit $${params.length}
+      `,
+      params
+    );
+
+    res.json({ items: q.rows });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /profile/:userId/pinned?viewerId=...
+// V1 rule: pinned returns public pinned to anyone; private pinned only to owner (friends later)
+app.get("/profile/:userId/pinned", async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const viewerId = String(req.query.viewerId || "").trim(); // optional
+  const limit = Math.min(Number(req.query.limit ?? 200) || 200, 500);
+
+  const client = await pool.connect();
+  try {
+    const params: any[] = [userId, limit];
+
+    const q = await client.query(
+      `
+      select
+        b.id,
+        b.owner_id,
+        b.title,
+        b.content,
+        b.visibility,
+        b.is_posted,
+        b.is_pinned,
+        b.pinned_order,
+        coalesce(b.posted_at, b.created_at) as feed_time
+      from blocks b
+      where b.owner_id = $1
+        and b.is_pinned = true
+        and b.is_posted = true
+        and (
+          b.visibility = 'public'
+          or (b.visibility = 'private' and $3::text = b.owner_id::text)
+        )
+      order by
+        b.pinned_order asc nulls last,
+        feed_time desc
+      limit $2
+      `,
+      // $3 is viewerId (or empty string)
+      [userId, limit, viewerId || ""]
+    );
+
+    res.json({ items: q.rows });
+  } finally {
+    client.release();
+  }
+});
+
+/* -----------------------
+   Pin/unpin + reorder
+------------------------ */
+
+// POST /blocks/:id/pin
+// Body: { ownerId, order? }
+app.post("/blocks/:id/pin", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  const ownerId = String(req.body?.ownerId || "").trim();
+  const order = req.body?.order !== undefined ? Number(req.body.order) : null;
+
+  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
+
+  const client = await pool.connect();
+  try {
+    const b = await client.query(`select id, owner_id, is_posted from blocks where id = $1 limit 1`, [blockId]);
+    if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
+    if (b.rows[0].owner_id !== ownerId) return res.status(403).json({ error: "not your block" });
+    if (b.rows[0].is_posted !== true) return res.status(403).json({ error: "can only pin posted blocks" });
+
+    await client.query(
+      `update blocks
+       set is_pinned = true,
+           pinned_order = coalesce($2, pinned_order),
+           updated_at = now()
+       where id = $1`,
+      [blockId, Number.isFinite(order as any) ? order : null]
+    );
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /blocks/:id/unpin
+// Body: { ownerId }
+app.post("/blocks/:id/unpin", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  const ownerId = String(req.body?.ownerId || "").trim();
+  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
+
+  const client = await pool.connect();
+  try {
+    const b = await client.query(`select id, owner_id from blocks where id = $1 limit 1`, [blockId]);
+    if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
+    if (b.rows[0].owner_id !== ownerId) return res.status(403).json({ error: "not your block" });
+
+    await client.query(
+      `update blocks
+       set is_pinned = false,
+           pinned_order = null,
+           updated_at = now()
+       where id = $1`,
+      [blockId]
+    );
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /profile/:userId/pins/reorder
+// Body: { viewerId, orderedBlockIds: [uuid...] }
+app.post("/profile/:userId/pins/reorder", async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  const viewerId = String(req.body?.viewerId || "").trim();
+  const orderedBlockIds = Array.isArray(req.body?.orderedBlockIds) ? req.body.orderedBlockIds : null;
+
+  if (!viewerId) return res.status(400).json({ error: "viewerId is required" });
+  if (viewerId !== userId) return res.status(403).json({ error: "not your profile" });
+  if (!orderedBlockIds || orderedBlockIds.length === 0) return res.status(400).json({ error: "orderedBlockIds is required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    // Assign pinned_order = index in array
+    for (let i = 0; i < orderedBlockIds.length; i++) {
+      const id = String(orderedBlockIds[i]).trim();
+      await client.query(
+        `update blocks
+         set pinned_order = $3, updated_at = now()
+         where id = $1 and owner_id = $2 and is_pinned = true`,
+        [id, userId, i]
+      );
+    }
+
+    await client.query("commit");
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error(err);
+    try { await client.query("rollback"); } catch {}
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
+
