@@ -655,7 +655,13 @@ app.get("/blocks/:id", async (req, res) => {
       return res.status(404).json({ error: "block not found" });
     }
 
-    res.json(q.rows[0]);
+    {
+  const row = q.rows[0];
+  res.json({
+    ...row,
+    can_appear_in_feed: row.is_posted === true && row.visibility === "public"
+  });
+}
   } catch (err: any) {
     console.error(err);
     res.status(500).json({ error: err?.message ?? "unknown" });
