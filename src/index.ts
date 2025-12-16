@@ -87,7 +87,7 @@ app.get("/library/trending", async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 30) || 30, 100);
   const client = await pool.connect();
   try {
-    // 24h first
+    // 24h first; if not enough, expand to 48h then 7d; else empty
     const q24 = await client.query(
       `select * from library_template_stats
        where template_usage_24h > 0
@@ -97,7 +97,6 @@ app.get("/library/trending", async (req, res) => {
     );
     if (q24.rows.length >= limit) return res.json({ items: q24.rows, window: "24h" });
 
-    // If not enough, expand to 48h computed directly from blocks.origin_template_block_id
     const q48 = await client.query(
       `
       select
@@ -110,7 +109,6 @@ app.get("/library/trending", async (req, res) => {
         coalesce(u.usage_24h, 0)::int as template_usage_24h,
         coalesce(u.usage_7d, 0)::int as template_usage_7d,
         coalesce(u.usage_48h, 0)::int as template_usage_48h,
-        -- keep these if present in your view, otherwise harmless
         coalesce((select count(*) from remix_edges re where re.parent_block_id = li.template_block_id), 0)::int as remix_count_all_time,
         coalesce((select count(*) from block_likes bl where bl.block_id = li.template_block_id), 0)::int as like_count_all_time,
         (coalesce(u.usage_24h,0) * 10)::int as trending_score_24h,
@@ -136,7 +134,6 @@ app.get("/library/trending", async (req, res) => {
     );
 
     if (q48.rows.length > 0) {
-      // If q24 had some results, top-up with q48 without duplicates (by template_block_id)
       const seen = new Set(q24.rows.map((r: any) => r.template_block_id));
       const topped = [...q24.rows];
       for (const r of q48.rows) {
@@ -146,7 +143,6 @@ app.get("/library/trending", async (req, res) => {
       return res.json({ items: topped, window: "48h+topup" });
     }
 
-    // Final fallback: 7d from your view
     const q7d = await client.query(
       `select * from library_template_stats
        where template_usage_7d > 0
@@ -163,7 +159,42 @@ app.get("/library/trending", async (req, res) => {
 });
 
 /* -----------------------
-   Likes (public blocks)
+   Drafts (user-private library category)
+------------------------ */
+
+app.get("/library/drafts", async (req, res) => {
+  const ownerId = String(req.query.ownerId || "").trim();
+  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
+  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
+
+  const client = await pool.connect();
+  try {
+    const q = await client.query(
+      `
+      select
+        id,
+        owner_id,
+        title,
+        content,
+        visibility,
+        created_at,
+        updated_at
+      from blocks
+      where owner_id = $1
+        and is_posted = false
+      order by coalesce(updated_at, created_at) desc
+      limit $2
+      `,
+      [ownerId, limit]
+    );
+    res.json({ items: q.rows });
+  } finally {
+    client.release();
+  }
+});
+
+/* -----------------------
+   Likes
 ------------------------ */
 
 app.post("/blocks/:id/like", async (req, res) => {
@@ -173,11 +204,13 @@ app.post("/blocks/:id/like", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const b = await client.query(`select id, visibility from blocks where id = $1 limit 1`, [blockId]);
+    const b = await client.query(`select id, visibility, is_posted from blocks where id = $1 limit 1`, [blockId]);
     if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
 
-    const visibility = b.rows[0].visibility as string;
-    if (visibility !== "public") return res.status(403).json({ error: "can only like public blocks" });
+    // Like only makes sense on public posted items (v1)
+    if (b.rows[0].visibility !== "public" || b.rows[0].is_posted !== true) {
+      return res.status(403).json({ error: "can only like public posted blocks" });
+    }
 
     await client.query(
       `insert into block_likes (block_id, user_id)
@@ -213,18 +246,40 @@ app.delete("/blocks/:id/like", async (req, res) => {
 });
 
 /* -----------------------
-   Blocks
+   Blocks: Save Draft / Post (explicit)
 ------------------------ */
 
+/**
+ * POST /blocks
+ * Body:
+ * {
+ *   ownerId,
+ *   blockId? (to update an existing draft),
+ *   title?,
+ *   content,
+ *   visibility: "public" | "private",
+ *   action: "draft" | "post"
+ * }
+ *
+ * Rules:
+ * - action=draft => is_posted=false, posted_at=NULL
+ * - action=post  => is_posted=true,  posted_at=NOW()
+ * - posted+public => appears in feed
+ * - posted+private => NOT in feed; appears in user's Private tab (friends-only, later)
+ * - Update-in-place: if blockId provided, must be owned by ownerId and must NOT already be posted
+ */
 app.post("/blocks", async (req, res) => {
   const ownerId = String(req.body?.ownerId || "").trim();
-  const visibility = String(req.body?.visibility || "").trim();
+  const blockId = req.body?.blockId ? String(req.body.blockId).trim() : null;
   const title = req.body?.title ? String(req.body.title).trim() : null;
   const content = String(req.body?.content || "");
+  const visibility = String(req.body?.visibility || "").trim(); // public|private
+  const action = String(req.body?.action || "").trim(); // draft|post
 
   if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-  if (!["private", "public", "pinned"].includes(visibility)) return res.status(400).json({ error: "invalid visibility" });
   if (!content.trim()) return res.status(400).json({ error: "content is required" });
+  if (!["public", "private"].includes(visibility)) return res.status(400).json({ error: "visibility must be public or private" });
+  if (!["draft", "post"].includes(action)) return res.status(400).json({ error: "action must be draft or post" });
 
   const sk = buildSkeleton(content);
   const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + content);
@@ -233,19 +288,50 @@ app.post("/blocks", async (req, res) => {
   try {
     await client.query("begin");
 
-    const created = await client.query(
-      `insert into blocks (owner_id, visibility, is_posted, title, content, ai_tag_suggestions, origin_template_block_id)
-       values ($1, $2, false, $3, $4, $5::jsonb, null)
-       returning id`,
-      [ownerId, visibility, title, content, JSON.stringify(suggestedTags)]
-    );
+    let id: string;
 
-    const blockId = created.rows[0].id as string;
+    if (blockId) {
+      const cur = await client.query(
+        `select id, owner_id, is_posted from blocks where id = $1 limit 1`,
+        [blockId]
+      );
+      if (cur.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
+      if (cur.rows[0].owner_id !== ownerId) { await client.query("rollback"); return res.status(403).json({ error: "not your block" }); }
+      if (cur.rows[0].is_posted === true) { await client.query("rollback"); return res.status(403).json({ error: "cannot edit a posted block in-place" }); }
+
+      const posted = action === "post";
+      await client.query(
+        `update blocks
+         set title = $2,
+             content = $3,
+             visibility = $4,
+             is_posted = $5,
+             posted_at = case when $5 then now() else null end,
+             updated_at = now(),
+             ai_tag_suggestions = $6::jsonb
+         where id = $1`,
+        [blockId, title, content, visibility, posted, JSON.stringify(suggestedTags)]
+      );
+      id = blockId;
+    } else {
+      const posted = action === "post";
+      const created = await client.query(
+        `insert into blocks (owner_id, visibility, is_posted, posted_at, title, content, ai_tag_suggestions, origin_template_block_id)
+         values ($1, $2, $3, case when $3 then now() else null end, $4, $5, $6::jsonb, null)
+         returning id`,
+        [ownerId, visibility, posted, title, content, JSON.stringify(suggestedTags)]
+      );
+      id = created.rows[0].id as string;
+    }
+
+    // versioning: append new version for every save/post
+    const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [id]);
+    const nextV = Number(v.rows[0].max_v) + 1;
 
     await client.query(
       `insert into block_versions (block_id, version_num, title, content, meta)
-       values ($1, 1, $2, $3, '{}'::jsonb)`,
-      [blockId, title, content]
+       values ($1, $2, $3, $4, $5)`,
+      [id, nextV, title, content, JSON.stringify({ action, visibility })]
     );
 
     await client.query(
@@ -258,11 +344,18 @@ app.post("/blocks", async (req, res) => {
          line_count    = excluded.line_count,
          status        = 'heuristic',
          updated_at    = now()`,
-      [blockId, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
+      [id, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
     );
 
     await client.query("commit");
-    res.json({ id: blockId, suggestedTags, skeletonSig: sk.skeletonSig });
+    res.json({
+      id,
+      action,
+      visibility,
+      is_posted: action === "post",
+      suggestedTags,
+      skeletonSig: sk.skeletonSig
+    });
   } catch (err: any) {
     console.error(err);
     try { await client.query("rollback"); } catch {}
@@ -272,19 +365,21 @@ app.post("/blocks", async (req, res) => {
   }
 });
 
+/**
+ * POST /blocks/:id/remix
+ * Creates a NEW draft block and returns its id for the editor.
+ * Rule: cannot remix private blocks.
+ * Origin credit only comes from library templates (or inherited template origin).
+ */
 app.post("/blocks/:id/remix", async (req, res) => {
   const parentBlockId = String(req.params.id).trim();
   const ownerId = String(req.body?.ownerId || "").trim();
-  const visibility = String(req.body?.visibility || "private").trim();
-
   if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-  if (!["private", "public", "pinned"].includes(visibility)) return res.status(400).json({ error: "invalid visibility" });
 
   const client = await pool.connect();
   try {
     await client.query("begin");
 
-    // include origin_template_block_id so we can preserve template credit
     const parent = await client.query(
       `select id, title, content, visibility, origin_template_block_id
        from blocks
@@ -292,76 +387,62 @@ app.post("/blocks/:id/remix", async (req, res) => {
        limit 1`,
       [parentBlockId]
     );
+    if (parent.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "parent block not found" }); }
+    if (parent.rows[0].visibility !== "public") { await client.query("rollback"); return res.status(403).json({ error: "cannot remix a non-public block" }); }
 
-    if (parent.rows.length === 0) {
-      await client.query("rollback");
-      return res.status(404).json({ error: "parent block not found" });
-    }
-
-    if (parent.rows[0].visibility === "private") {
-      await client.query("rollback");
-      return res.status(403).json({ error: "cannot remix a private block" });
-    }
-
-    // Determine if parent is a library template
     const isTemplate = await client.query(
       `select 1 from library_items where template_block_id = $1 limit 1`,
       [parentBlockId]
     );
 
-    // Origin credit rule:
-    // 1) If parent already credits a template, inherit it (this credits the original template forever)
-    // 2) Else if parent itself is a template, set origin to parent
-    // 3) Else origin is null (don’t create fake template origins from random posts)
     const originTemplateBlockId =
       (parent.rows[0].origin_template_block_id as string | null) ??
       (isTemplate.rows.length > 0 ? parentBlockId : null);
 
-    const pv = await client.query(
-      `select id, version_num, title, content
-       from block_versions
-       where block_id = $1
-       order by version_num desc
-       limit 1`,
-      [parentBlockId]
-    );
-
-    const parentVersionId = pv.rows.length ? (pv.rows[0].id as string) : null;
     const parentTitle = parent.rows[0].title as string | null;
     const parentContent = parent.rows[0].content as string;
 
     const sk = buildSkeleton(parentContent);
     const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + parentContent);
 
+    // Remix creates a DRAFT (private + not posted)
     const child = await client.query(
       `insert into blocks (
          owner_id,
          visibility,
          is_posted,
+         posted_at,
          title,
          content,
          ai_tag_suggestions,
          origin_template_block_id
        )
-       values ($1, $2, false, $3, $4, $5::jsonb, $6)
+       values ($1, 'private', false, null, $2, $3, $4::jsonb, $5)
        returning id`,
-      [
-        ownerId,
-        visibility,
-        parentTitle,
-        parentContent,
-        JSON.stringify(suggestedTags),
-        originTemplateBlockId
-      ]
+      [ownerId, parentTitle, parentContent, JSON.stringify(suggestedTags), originTemplateBlockId]
     );
-
     const childBlockId = child.rows[0].id as string;
+
+    const pv = await client.query(
+      `select id
+       from block_versions
+       where block_id = $1
+       order by version_num desc
+       limit 1`,
+      [parentBlockId]
+    );
+    const parentVersionId = pv.rows.length ? (pv.rows[0].id as string) : null;
 
     const childV1 = await client.query(
       `insert into block_versions (block_id, version_num, title, content, meta)
        values ($1, 1, $2, $3, $4)
        returning id`,
-      [childBlockId, parentTitle, parentContent, JSON.stringify({ remixed_from: parentBlockId, parent_version_id: parentVersionId })]
+      [
+        childBlockId,
+        parentTitle,
+        parentContent,
+        JSON.stringify({ action: "remix", remixed_from: parentBlockId, parent_version_id: parentVersionId })
+      ]
     );
     const childVersionId = childV1.rows[0].id as string;
 
@@ -391,7 +472,12 @@ app.post("/blocks/:id/remix", async (req, res) => {
     );
 
     await client.query("commit");
-    res.json({ id: childBlockId, remixedFrom: parentBlockId, originTemplateBlockId, suggestedTags });
+    res.json({
+      id: childBlockId,
+      remixedFrom: parentBlockId,
+      originTemplateBlockId,
+      suggestedTags
+    });
   } catch (err: any) {
     console.error(err);
     try { await client.query("rollback"); } catch {}
@@ -401,45 +487,18 @@ app.post("/blocks/:id/remix", async (req, res) => {
   }
 });
 
-app.post("/blocks/:id/post", async (req, res) => {
-  const blockId = String(req.params.id).trim();
-  const ownerId = String(req.body?.ownerId || "").trim();
-  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-
-  const client = await pool.connect();
-  try {
-    const b = await client.query(`select id, owner_id, visibility, is_posted from blocks where id = $1 limit 1`, [blockId]);
-    if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
-    if (b.rows[0].owner_id !== ownerId) return res.status(403).json({ error: "not your block" });
-    if (b.rows[0].visibility !== "public") return res.status(403).json({ error: "can only post public blocks" });
-    if (b.rows[0].is_posted === true) return res.json({ ok: true, alreadyPosted: true });
-
-    await client.query(
-      `update blocks
-       set is_posted = true,
-           posted_at = now(),
-           updated_at = now()
-       where id = $1`,
-      [blockId]
-    );
-
-    res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
+/* -----------------------
+   Feed (public posted only)
+------------------------ */
 
 app.get("/feed", async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
-  const before = req.query.before ? String(req.query.before) : null; // ISO timestamp cursor
+  const before = req.query.before ? String(req.query.before) : null;
 
   const client = await pool.connect();
   try {
     const params: any[] = [];
-    let where = `where b.visibility = 'public' and b.is_posted = true`;
+    let where = `where b.is_posted = true and b.visibility = 'public'`;
 
     if (before) {
       params.push(before);
@@ -482,94 +541,8 @@ app.get("/feed", async (req, res) => {
   }
 });
 
-app.put("/blocks/:id", async (req, res) => {
-  const blockId = String(req.params.id).trim();
-  const title = req.body?.title ? String(req.body.title).trim() : null;
-  const content = String(req.body?.content || "");
-  if (!content.trim()) return res.status(400).json({ error: "content is required" });
-
-  const sk = buildSkeleton(content);
-  const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + content);
-
-  const client = await pool.connect();
-  try {
-    await client.query("begin");
-
-    const current = await client.query(`select id, content from blocks where id = $1 limit 1`, [blockId]);
-    if (current.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
-    const oldContent = current.rows[0].content as string;
-
-    const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [blockId]);
-    const nextV = Number(v.rows[0].max_v) + 1;
-
-    await client.query(
-      `update blocks
-       set title = $2,
-           content = $3,
-           updated_at = now(),
-           ai_tag_suggestions = $4::jsonb
-       where id = $1`,
-      [blockId, title, content, JSON.stringify(suggestedTags)]
-    );
-
-    const newVersion = await client.query(
-      `insert into block_versions (block_id, version_num, title, content, meta)
-       values ($1, $2, $3, $4, '{}'::jsonb)
-       returning id`,
-      [blockId, nextV, title, content]
-    );
-    const newVersionId = newVersion.rows[0].id as string;
-
-    await client.query(
-      `insert into block_templates (block_id, skeleton_text, skeleton_sig, slot_count, line_count, status, updated_at)
-       values ($1, $2, $3, $4, $5, 'heuristic', now())
-       on conflict (block_id) do update set
-         skeleton_text = excluded.skeleton_text,
-         skeleton_sig  = excluded.skeleton_sig,
-         slot_count    = excluded.slot_count,
-         line_count    = excluded.line_count,
-         status        = 'heuristic',
-         updated_at    = now()`,
-      [blockId, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
-    );
-
-    const edge = await client.query(
-      `select parent_block_id, parent_version_id from remix_edges where child_block_id = $1 limit 1`,
-      [blockId]
-    );
-
-    if (edge.rows.length > 0) {
-      const parentBlockId = edge.rows[0].parent_block_id as string;
-      const parentVersionId = edge.rows[0].parent_version_id as string | null;
-
-      let parentText = oldContent;
-      if (parentVersionId) {
-        const pv = await client.query(`select content from block_versions where id = $1 limit 1`, [parentVersionId]);
-        if (pv.rows.length) parentText = pv.rows[0].content as string;
-      }
-
-      const diff = diffLines(parentText, content);
-
-      await client.query(
-        `insert into block_diffs (child_block_id, parent_block_id, child_version_id, parent_version_id, diff)
-         values ($1, $2, $3, $4, $5::jsonb)`,
-        [blockId, parentBlockId, newVersionId, parentVersionId, JSON.stringify(diff)]
-      );
-    }
-
-    await client.query("commit");
-    res.json({ ok: true, version: nextV, suggestedTags });
-  } catch (err: any) {
-    console.error(err);
-    try { await client.query("rollback"); } catch {}
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
 /* -----------------------
-   Admin endpoints
+   Admin endpoints (kept)
 ------------------------ */
 
 app.get("/admin/library/dupes", async (req, res) => {
