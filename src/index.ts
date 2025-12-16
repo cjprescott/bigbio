@@ -143,48 +143,49 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
   if (!handle) return res.status(400).json({ error: "handle required" });
 
   const pinned = String(req.query.pinned || "").trim().toLowerCase() === "true";
-  const visibilityQuery = String(req.query.visibility || "").trim().toLowerCase(); // "private" supported
+  const drafts = String(req.query.drafts || "").trim().toLowerCase() === "true";
+  const visibilityQuery = String(req.query.visibility || "").trim().toLowerCase();
 
   const client = await pool.connect();
   try {
+    // Get profile user
     const p = await client.query(
       `select user_id, handle from user_profiles where lower(handle) = $1 limit 1`,
       [handle]
     );
     if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
-
     const profileUserId = p.rows[0].user_id as string;
 
+    // PINNED BLOCKS - public, anyone can see
     if (pinned) {
-      if (pinned) {
-        const q = await client.query(
-          `
-          select
-            b.id,
-            b.owner_id,
-            b.title,
-            b.content,
-            b.visibility,
-            b.is_posted,
-            b.is_pinned,
-            b.pinned_order,
-            b.created_at,
-            b.posted_at
-          from blocks b
-          where b.owner_id = $1
-            and b.is_posted = true
-            and b.is_pinned = true
-            and b.visibility = 'public'
-          order by b.pinned_order asc nulls last, b.posted_at desc nulls last, b.created_at desc
-          `,
-          [profileUserId]
-        );
-        return res.json({ items: q.rows });
-      }
+      const q = await client.query(
+        `
+        select
+          b.id,
+          b.owner_id,
+          b.title,
+          b.content,
+          b.visibility,
+          b.is_posted,
+          b.is_pinned,
+          b.pinned_order,
+          b.created_at,
+          b.posted_at,
+          (select count(*)::int from block_likes bl where bl.block_id = b.id) as like_count,
+          (select count(*)::int from remix_edges re where re.parent_block_id = b.id) as remix_count
+        from blocks b
+        where b.owner_id = $1
+          and b.is_posted = true
+          and b.is_pinned = true
+          and b.visibility = 'public'
+        order by b.pinned_order asc nulls last, b.posted_at desc nulls last, b.created_at desc
+        `,
+        [profileUserId]
+      );
       return res.json({ items: q.rows });
     }
 
-    const drafts = String(req.query.drafts || "").trim().toLowerCase() === "true";
+    // DRAFTS - owner only
     if (drafts) {
       const viewer = requireAuth(req, res);
       if (!viewer) return;
@@ -205,18 +206,16 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
           b.created_at,
           b.updated_at
         from blocks b
-        where b.owner_id = 
+        where b.owner_id = $1
           and b.is_posted = false
         order by b.updated_at desc nulls last, b.created_at desc
         `,
         [profileUserId]
       );
-
       return res.json({ items: q.rows });
     }
 
-
-
+    // PRIVATE BLOCKS - owner only
     if (visibilityQuery === "private") {
       const viewer = requireAuth(req, res);
       if (!viewer) return;
@@ -234,18 +233,24 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
           b.visibility,
           b.is_posted,
           b.created_at,
-          (
-            select count(*)::int from block_likes bl where bl.block_id = b.id
-          ) as like_count,
-          (
-            select count(*)::int from remix_edges re where re.parent_block_id = b.id
-          ) as remix_count
+          (select count(*)::int from block_likes bl where bl.block_id = b.id) as like_count,
+          (select count(*)::int from remix_edges re where re.parent_block_id = b.id) as remix_count
         from blocks b
         where b.owner_id = $1
+          and b.is_posted = true
           and b.visibility = 'private'
         order by b.created_at desc
         `,
         [profileUserId]
+      );
+      return res.json({ items: q.rows });
+    }
+
+    return res.status(400).json({ error: "use ?pinned=true or ?visibility=private or ?drafts=true" });
+  } finally {
+    client.release();
+  }
+});
       );
 
       // Add the subtle “🔒🤫 @a @b” hint (owner-only)
