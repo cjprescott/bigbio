@@ -1,5 +1,3 @@
-import dns from "dns";
-
 import express from "express";
 import dns from "dns";
 import { pool } from "./db.js";
