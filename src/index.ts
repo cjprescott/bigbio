@@ -67,7 +67,7 @@ app.get("/library/popular", async (req, res) => {
     const q1 = await client.query(
       `select * from library_template_stats
        where popular_score_7d > 0
-       order by popular_score_7d desc, remix_count_7d desc, like_count_7d desc
+       order by popular_score_7d desc, template_usage_7d desc
        limit $1`,
       [limit]
     );
@@ -95,7 +95,7 @@ app.get("/library/trending", async (req, res) => {
     const q1 = await client.query(
       `select * from library_template_stats
        where trending_score_24h > 0
-       order by trending_score_24h desc, remix_count_24h desc, like_count_24h desc
+       order by trending_score_24h desc, template_usage_24h desc
        limit $1`,
       [limit]
     );
