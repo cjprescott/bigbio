@@ -12,6 +12,17 @@ app.get("/", (_req, res) => {
   res.json({ status: "BigBio API running" });
 });
 
+app.get("/health/env", (_req, res) => {
+  const hasDatabaseUrl =
+    typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.length > 0;
+
+  res.json({
+    hasDatabaseUrl,
+    databaseUrlLength: process.env.DATABASE_URL?.length ?? 0,
+    nodeVersion: process.version
+  });
+});
+
 app.get("/health/db", async (_req, res) => {
   try {
     if (!process.env.DATABASE_URL) {
@@ -20,16 +31,16 @@ app.get("/health/db", async (_req, res) => {
 
     const pool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false } // Supabase requires SSL
+      ssl: { rejectUnauthorized: false }
     });
 
     const result = await pool.query("select 1 as ok");
     await pool.end();
 
     return res.json({ db: "ok", result: result.rows[0] });
-  } catch (err) {
+  } catch (err: any) {
     console.error(err);
-    return res.status(500).json({ db: "error" });
+    return res.status(500).json({ db: "error", message: String(err?.message ?? err) });
   }
 });
 
