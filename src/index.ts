@@ -205,6 +205,7 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
         `,
         [profileUserId]
       );
+
       return res.json({ items: q.rows });
     }
 
