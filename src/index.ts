@@ -4,7 +4,14 @@ import { pool } from "./db.js";
 import { buildSkeleton } from "./skeletonize.js";
 import { suggestTagsFromContent } from "./tagSuggest.js";
 import { diffLines } from "./diff.js";
+import cors from "cors";
 
+app.use(cors({
+  origin: ['http://localhost:5173', 'http://localhost:3000'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-User-Id', 'Authorization'],
+}));
 
 dns.setDefaultResultOrder("ipv4first");
 
