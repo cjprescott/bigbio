@@ -1,9 +1,12 @@
+import dns from "dns";
+
 import express from "express";
 import dns from "dns";
 import { pool } from "./db.js";
 import { buildSkeleton } from "./skeletonize.js";
 import { suggestTagsFromContent } from "./tagSuggest.js";
 import { diffLines } from "./diff.js";
+
 
 dns.setDefaultResultOrder("ipv4first");
 
@@ -173,8 +176,10 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
           ) as remix_count
         from blocks b
         where b.owner_id = $1
-          and b.visibility = 'pinned'
-        order by b.created_at asc
+          and b.is_pinned = true
+          and b.is_posted = true
+          and b.visibility = 'public'
+        order by b.pinned_order asc nulls last, b.posted_at desc nulls last, b.created_at desc
         `,
         [profileUserId]
       );
