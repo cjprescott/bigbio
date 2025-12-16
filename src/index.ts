@@ -148,15 +148,14 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    // Get profile user
     const p = await client.query(
       `select user_id, handle from user_profiles where lower(handle) = $1 limit 1`,
       [handle]
     );
     if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
     const profileUserId = p.rows[0].user_id as string;
 
-    // PINNED BLOCKS - public, anyone can see
     if (pinned) {
       const q = await client.query(
         `
@@ -185,7 +184,6 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
       return res.json({ items: q.rows });
     }
 
-    // DRAFTS - owner only
     if (drafts) {
       const viewer = requireAuth(req, res);
       if (!viewer) return;
@@ -215,7 +213,6 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
       return res.json({ items: q.rows });
     }
 
-    // PRIVATE BLOCKS - owner only
     if (visibilityQuery === "private") {
       const viewer = requireAuth(req, res);
       if (!viewer) return;
@@ -243,17 +240,8 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
         `,
         [profileUserId]
       );
-      return res.json({ items: q.rows });
-    }
 
-    return res.status(400).json({ error: "use ?pinned=true or ?visibility=private or ?drafts=true" });
-  } finally {
-    client.release();
-  }
-});
-      );
-
-      // Add the subtle “🔒🤫 @a @b” hint (owner-only)
+      // Add the lock hint for invited users
       const blockIds = q.rows.map(r => r.id);
       const access = blockIds.length
         ? await client.query(
@@ -282,8 +270,6 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
       return res.json({ items });
     }
 
-    // Default: "public tab" for OWNER only is not in MVP yet (you said only pinned is visible to others).
-    // We intentionally do not expose public/non-pinned listing to other users here.
     return res.status(400).json({ error: "use ?pinned=true or ?visibility=private or ?drafts=true" });
   } finally {
     client.release();
