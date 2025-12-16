@@ -184,6 +184,68 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
       return res.json({ items: q.rows });
     }
 
+    const drafts = String(req.query.drafts || "").trim().toLowerCase() === "true";
+    if (drafts) {
+      const viewer = requireAuth(req, res);
+      if (!viewer) return;
+      if (viewer !== profileUserId) {
+        return res.status(403).json({ error: "drafts are only visible to the profile owner" });
+      }
+
+      const q = await client.query(
+        `
+        select
+          b.id,
+          b.owner_id,
+          b.title,
+          b.content,
+          b.visibility,
+          b.draft_visibility,
+          b.is_posted,
+          b.updated_at,
+          b.created_at
+        from blocks b
+        where b.owner_id = 
+
+    if (pinned) {
+      const q = await client.query(
+        `
+        select
+          b.id,
+          b.owner_id,
+          b.title,
+          b.content,
+          b.visibility,
+          b.is_posted,
+          b.created_at,
+          (
+            select count(*)::int from block_likes bl where bl.block_id = b.id
+          ) as like_count,
+          (
+            select count(*)::int from remix_edges re where re.parent_block_id = b.id
+          ) as remix_count
+        from blocks b
+        where b.owner_id = $1
+          and b.is_pinned = true
+          and b.is_posted = true
+          and b.visibility = 'public'
+        order by b.pinned_order asc nulls last, b.posted_at desc nulls last, b.created_at desc
+        `,
+        [profileUserId]
+      );
+      return res.json({ items: q.rows });
+    }
+
+          and b.is_posted = false
+        order by b.updated_at desc, b.created_at desc
+        `,
+        [profileUserId]
+      );
+
+      return res.json({ items: q.rows });
+    }
+
+
     if (visibilityQuery === "private") {
       const viewer = requireAuth(req, res);
       if (!viewer) return;
@@ -246,7 +308,7 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
 
     // Default: "public tab" for OWNER only is not in MVP yet (you said only pinned is visible to others).
     // We intentionally do not expose public/non-pinned listing to other users here.
-    return res.status(400).json({ error: "use ?pinned=true or ?visibility=private" });
+    return res.status(400).json({ error: "use ?pinned=true or ?visibility=private or ?drafts=true" });
   } finally {
     client.release();
   }
