@@ -602,3 +602,64 @@ app.get("/admin/library/dupes", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`BigBio API running on port ${PORT}`));
+
+/* -----------------------
+   Block Card
+------------------------ */
+
+/**
+ * GET /blocks/:id
+ * Returns all data needed for the Block Card view
+ */
+app.get("/blocks/:id", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  if (!blockId) return res.status(400).json({ error: "blockId is required" });
+
+  const client = await pool.connect();
+  try {
+    const q = await client.query(
+      `
+      select
+        b.id,
+        b.owner_id,
+        b.title,
+        b.content,
+        b.visibility,
+        b.is_posted,
+        b.origin_template_block_id,
+        b.created_at,
+        b.updated_at,
+        coalesce(lc.like_count, 0)::int as like_count,
+        coalesce(rc.remix_count, 0)::int as remix_count,
+        re.parent_block_id
+      from blocks b
+      left join (
+        select block_id, count(*)::int as like_count
+        from block_likes
+        group by block_id
+      ) lc on lc.block_id = b.id
+      left join (
+        select parent_block_id as block_id, count(*)::int as remix_count
+        from remix_edges
+        group by parent_block_id
+      ) rc on rc.block_id = b.id
+      left join remix_edges re
+        on re.child_block_id = b.id
+      where b.id = $1
+      limit 1
+      `,
+      [blockId]
+    );
+
+    if (q.rows.length === 0) {
+      return res.status(404).json({ error: "block not found" });
+    }
+
+    res.json(q.rows[0]);
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
