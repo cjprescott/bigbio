@@ -10,7 +10,6 @@ dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const FUZZY_DUP_THRESHOLD = 0.75;
 
 // CORS goes HERE - after app is created
 app.use(cors({
