@@ -13,6 +13,29 @@ const FUZZY_DUP_THRESHOLD = 0.75;
 
 app.use(express.json());
 
+/* -----------------------
+   Auth helpers (simple)
+   - For now: require X-User-Id: <uuid>
+   - Later: swap to real OAuth/JWT without changing handlers.
+------------------------ */
+function getAuthUserId(req: express.Request): string | null {
+  const h = String(req.header("x-user-id") || "").trim();
+  if (!h) return null;
+  return h;
+}
+
+function requireAuth(req: express.Request, res: express.Response): string | null {
+  const uid = getAuthUserId(req);
+  if (!uid) {
+    res.status(401).json({ error: "auth required (send X-User-Id header)" });
+    return null;
+  }
+  return uid;
+}
+
+/* -----------------------
+   Health
+------------------------ */
 app.get("/", (_req, res) => res.json({ status: "BigBio API running" }));
 
 app.get("/health/env", (_req, res) => {
@@ -39,7 +62,287 @@ app.get("/health/db", async (_req, res) => {
 });
 
 /* -----------------------
-   Library (global lists)
+   Profiles
+------------------------ */
+
+/**
+ * GET /profiles/:handle
+ * Public profile header info + live counts
+ */
+app.get("/profiles/:handle", async (req, res) => {
+  const handle = String(req.params.handle || "").trim().toLowerCase();
+  if (!handle) return res.status(400).json({ error: "handle required" });
+
+  const client = await pool.connect();
+  try {
+    const p = await client.query(
+      `
+      select
+        up.user_id,
+        up.handle,
+        up.avatar_url,
+        up.bg_style,
+        up.created_at,
+        (
+          select count(*)::int
+          from follows f
+          where f.followee_user_id = up.user_id
+        ) as follower_count,
+        (
+          select count(*)::int
+          from follows f
+          where f.follower_user_id = up.user_id
+        ) as following_count,
+        (
+          select coalesce(count(*),0)::int
+          from block_likes bl
+          join blocks b on b.id = bl.block_id
+          where b.owner_id = up.user_id
+        ) as total_likes
+      from user_profiles up
+      where lower(up.handle) = $1
+      limit 1
+      `,
+      [handle]
+    );
+
+    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
+    const viewer = getAuthUserId(req);
+    const isOwner = viewer && viewer === p.rows[0].user_id;
+
+    let viewerFollows = false;
+    if (viewer) {
+      const f = await client.query(
+        `select 1 from follows where follower_user_id = $1 and followee_user_id = $2 limit 1`,
+        [viewer, p.rows[0].user_id]
+      );
+      viewerFollows = f.rows.length > 0;
+    }
+
+    res.json({ ...p.rows[0], is_owner: !!isOwner, viewer_follows: viewerFollows });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * GET /profiles/:handle/blocks?pinned=true
+ * Public: only pinned blocks visible to others.
+ *
+ * GET /profiles/:handle/blocks?visibility=private
+ * Auth-gated: ONLY owner can fetch private blocks list.
+ *
+ * Note: We keep ordering simple for v1:
+ * - pinned: created_at asc (TODO: add pinned_order column later)
+ * - public/private: created_at desc
+ */
+app.get("/profiles/:handle/blocks", async (req, res) => {
+  const handle = String(req.params.handle || "").trim().toLowerCase();
+  if (!handle) return res.status(400).json({ error: "handle required" });
+
+  const pinned = String(req.query.pinned || "").trim().toLowerCase() === "true";
+  const visibilityQuery = String(req.query.visibility || "").trim().toLowerCase(); // "private" supported
+
+  const client = await pool.connect();
+  try {
+    const p = await client.query(
+      `select user_id, handle from user_profiles where lower(handle) = $1 limit 1`,
+      [handle]
+    );
+    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
+    const profileUserId = p.rows[0].user_id as string;
+
+    if (pinned) {
+      const q = await client.query(
+        `
+        select
+          b.id,
+          b.owner_id,
+          b.title,
+          b.content,
+          b.visibility,
+          b.is_posted,
+          b.created_at,
+          (
+            select count(*)::int from block_likes bl where bl.block_id = b.id
+          ) as like_count,
+          (
+            select count(*)::int from remix_edges re where re.parent_block_id = b.id
+          ) as remix_count
+        from blocks b
+        where b.owner_id = $1
+          and b.visibility = 'pinned'
+        order by b.created_at asc
+        `,
+        [profileUserId]
+      );
+      return res.json({ items: q.rows });
+    }
+
+    if (visibilityQuery === "private") {
+      const viewer = requireAuth(req, res);
+      if (!viewer) return;
+      if (viewer !== profileUserId) {
+        return res.status(403).json({ error: "private blocks are only visible to the profile owner" });
+      }
+
+      const q = await client.query(
+        `
+        select
+          b.id,
+          b.owner_id,
+          b.title,
+          b.content,
+          b.visibility,
+          b.is_posted,
+          b.created_at,
+          (
+            select count(*)::int from block_likes bl where bl.block_id = b.id
+          ) as like_count,
+          (
+            select count(*)::int from remix_edges re where re.parent_block_id = b.id
+          ) as remix_count
+        from blocks b
+        where b.owner_id = $1
+          and b.visibility = 'private'
+        order by b.created_at desc
+        `,
+        [profileUserId]
+      );
+
+      // Add the subtle “🔒🤫 @a @b” hint (owner-only)
+      const blockIds = q.rows.map(r => r.id);
+      const access = blockIds.length
+        ? await client.query(
+            `
+            select
+              ba.block_id,
+              array_agg('@' || up.handle order by up.handle) as invited_handles
+            from block_access ba
+            join user_profiles up on up.user_id = ba.user_id
+            where ba.block_id = any($1::uuid[])
+            group by ba.block_id
+            `,
+            [blockIds]
+          )
+        : { rows: [] as any[] };
+
+      const accessMap = new Map<string, string[]>();
+      for (const row of access.rows) accessMap.set(row.block_id, row.invited_handles || []);
+
+      const items = q.rows.map(r => {
+        const invited = accessMap.get(r.id) || [];
+        const lock_hint = invited.length ? `🔒🤫 ${invited.join(" ")}` : "🔒🤫";
+        return { ...r, lock_hint };
+      });
+
+      return res.json({ items });
+    }
+
+    // Default: "public tab" for OWNER only is not in MVP yet (you said only pinned is visible to others).
+    // We intentionally do not expose public/non-pinned listing to other users here.
+    return res.status(400).json({ error: "use ?pinned=true or ?visibility=private" });
+  } finally {
+    client.release();
+  }
+});
+
+/* -----------------------
+   Follow
+------------------------ */
+
+/**
+ * POST /profiles/:handle/follow
+ * Auth required. Follow the profile owner.
+ */
+app.post("/profiles/:handle/follow", async (req, res) => {
+  const viewer = requireAuth(req, res);
+  if (!viewer) return;
+
+  const handle = String(req.params.handle || "").trim().toLowerCase();
+  if (!handle) return res.status(400).json({ error: "handle required" });
+
+  const client = await pool.connect();
+  try {
+    const p = await client.query(
+      `select user_id from user_profiles where lower(handle) = $1 limit 1`,
+      [handle]
+    );
+    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
+    const followee = p.rows[0].user_id as string;
+    if (followee === viewer) return res.status(400).json({ error: "cannot follow yourself" });
+
+    await client.query(
+      `
+      insert into follows (follower_user_id, followee_user_id)
+      values ($1, $2)
+      on conflict do nothing
+      `,
+      [viewer, followee]
+    );
+
+    // Live counts
+    const counts = await client.query(
+      `
+      select
+        (select count(*)::int from follows where followee_user_id = $1) as follower_count,
+        (select count(*)::int from follows where follower_user_id = $1) as following_count
+      `,
+      [followee]
+    );
+
+    res.json({ ok: true, follower_count: counts.rows[0].follower_count, following_count: counts.rows[0].following_count });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * DELETE /profiles/:handle/follow
+ * Auth required.
+ */
+app.delete("/profiles/:handle/follow", async (req, res) => {
+  const viewer = requireAuth(req, res);
+  if (!viewer) return;
+
+  const handle = String(req.params.handle || "").trim().toLowerCase();
+  if (!handle) return res.status(400).json({ error: "handle required" });
+
+  const client = await pool.connect();
+  try {
+    const p = await client.query(
+      `select user_id from user_profiles where lower(handle) = $1 limit 1`,
+      [handle]
+    );
+    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
+
+    const followee = p.rows[0].user_id as string;
+
+    await client.query(
+      `delete from follows where follower_user_id = $1 and followee_user_id = $2`,
+      [viewer, followee]
+    );
+
+    const counts = await client.query(
+      `
+      select
+        (select count(*)::int from follows where followee_user_id = $1) as follower_count,
+        (select count(*)::int from follows where follower_user_id = $1) as following_count
+      `,
+      [followee]
+    );
+
+    res.json({ ok: true, follower_count: counts.rows[0].follower_count, following_count: counts.rows[0].following_count });
+  } finally {
+    client.release();
+  }
+});
+
+/* -----------------------
+   Library endpoints (existing behavior)
 ------------------------ */
 
 app.get("/library/new", async (req, res) => {
@@ -65,7 +368,7 @@ app.get("/library/popular", async (req, res) => {
     const q1 = await client.query(
       `select * from library_template_stats
        where popular_score_7d > 0
-       order by popular_score_7d desc, template_usage_7d desc
+       order by popular_score_7d desc
        limit $1`,
       [limit]
     );
@@ -73,7 +376,7 @@ app.get("/library/popular", async (req, res) => {
 
     const q2 = await client.query(
       `select * from library_template_stats
-       order by popular_score_7d desc, template_usage_all_time desc
+       order by popular_score_7d desc
        limit $1`,
       [limit]
     );
@@ -87,105 +390,56 @@ app.get("/library/trending", async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 30) || 30, 100);
   const client = await pool.connect();
   try {
-    // 24h first; if not enough, expand to 48h then 7d; else empty
-    const q24 = await client.query(
+    const q1 = await client.query(
       `select * from library_template_stats
-       where template_usage_24h > 0
-       order by template_usage_24h desc
+       where trending_score_24h > 0
+       order by trending_score_24h desc
        limit $1`,
       [limit]
     );
-    if (q24.rows.length >= limit) return res.json({ items: q24.rows, window: "24h" });
+    if (q1.rows.length > 0) return res.json({ items: q1.rows });
 
-    const q48 = await client.query(
-      `
-      select
-        li.id as library_item_id,
-        li.title,
-        li.category_id,
-        li.template_block_id,
-        li.created_at as library_created_at,
-        coalesce(u.usage_all_time, 0)::int as template_usage_all_time,
-        coalesce(u.usage_24h, 0)::int as template_usage_24h,
-        coalesce(u.usage_7d, 0)::int as template_usage_7d,
-        coalesce(u.usage_48h, 0)::int as template_usage_48h,
-        coalesce((select count(*) from remix_edges re where re.parent_block_id = li.template_block_id), 0)::int as remix_count_all_time,
-        coalesce((select count(*) from block_likes bl where bl.block_id = li.template_block_id), 0)::int as like_count_all_time,
-        (coalesce(u.usage_24h,0) * 10)::int as trending_score_24h,
-        (coalesce(u.usage_7d,0) * 10)::int as popular_score_7d
-      from library_items li
-      left join (
-        select
-          origin_template_block_id as template_block_id,
-          count(*) filter (where id <> origin_template_block_id)::int as usage_all_time,
-          count(*) filter (where id <> origin_template_block_id and created_at > now() - interval '24 hours')::int as usage_24h,
-          count(*) filter (where id <> origin_template_block_id and created_at > now() - interval '48 hours')::int as usage_48h,
-          count(*) filter (where id <> origin_template_block_id and created_at > now() - interval '7 days')::int as usage_7d
-        from blocks
-        where origin_template_block_id is not null
-        group by origin_template_block_id
-      ) u on u.template_block_id = li.template_block_id
-      where li.is_active = true
-        and coalesce(u.usage_48h,0) > 0
-      order by coalesce(u.usage_48h,0) desc
-      limit $1
-      `,
-      [limit]
-    );
-
-    if (q48.rows.length > 0) {
-      const seen = new Set(q24.rows.map((r: any) => r.template_block_id));
-      const topped = [...q24.rows];
-      for (const r of q48.rows) {
-        if (!seen.has(r.template_block_id)) topped.push(r);
-        if (topped.length >= limit) break;
-      }
-      return res.json({ items: topped, window: "48h+topup" });
-    }
-
-    const q7d = await client.query(
+    const q2 = await client.query(
       `select * from library_template_stats
-       where template_usage_7d > 0
-       order by template_usage_7d desc
+       order by library_created_at desc
        limit $1`,
       [limit]
     );
-    if (q7d.rows.length > 0) return res.json({ items: q7d.rows, window: "7d" });
-
-    return res.json({ items: [], window: "empty" });
+    return res.json({ items: q2.rows });
   } finally {
     client.release();
   }
 });
 
 /* -----------------------
-   Drafts (user-private library category)
+   Feed (simple chronological)
+   can_appear_in_feed = is_posted && visibility === "public"
 ------------------------ */
-
-app.get("/library/drafts", async (req, res) => {
-  const ownerId = String(req.query.ownerId || "").trim();
-  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
-  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-
+app.get("/feed", async (req, res) => {
+  const limit = Math.min(Number(req.query.limit ?? 30) || 30, 100);
   const client = await pool.connect();
   try {
     const q = await client.query(
       `
       select
-        id,
-        owner_id,
-        title,
-        content,
-        visibility,
-        created_at,
-        updated_at
-      from blocks
-      where owner_id = $1
-        and is_posted = false
-      order by coalesce(updated_at, created_at) desc
-      limit $2
+        b.id,
+        b.owner_id,
+        b.title,
+        b.content,
+        b.created_at as feed_time,
+        (
+          select count(*)::int from block_likes bl where bl.block_id = b.id
+        ) as like_count,
+        (
+          select count(*)::int from remix_edges re where re.parent_block_id = b.id
+        ) as remix_count
+      from blocks b
+      where b.is_posted = true
+        and b.visibility = 'public'
+      order by b.created_at desc
+      limit $1
       `,
-      [ownerId, limit]
+      [limit]
     );
     res.json({ items: q.rows });
   } finally {
@@ -194,9 +448,8 @@ app.get("/library/drafts", async (req, res) => {
 });
 
 /* -----------------------
-   Likes
+   Likes (public blocks only)
 ------------------------ */
-
 app.post("/blocks/:id/like", async (req, res) => {
   const blockId = String(req.params.id).trim();
   const userId = String(req.body?.userId || "").trim();
@@ -204,13 +457,10 @@ app.post("/blocks/:id/like", async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const b = await client.query(`select id, visibility, is_posted from blocks where id = $1 limit 1`, [blockId]);
+    const b = await client.query(`select id, visibility from blocks where id = $1 limit 1`, [blockId]);
     if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
 
-    // Like only makes sense on public posted items (v1)
-    if (b.rows[0].visibility !== "public" || b.rows[0].is_posted !== true) {
-      return res.status(403).json({ error: "can only like public posted blocks" });
-    }
+    if (String(b.rows[0].visibility) !== "public") return res.status(403).json({ error: "can only like public blocks" });
 
     await client.query(
       `insert into block_likes (block_id, user_id)
@@ -220,9 +470,6 @@ app.post("/blocks/:id/like", async (req, res) => {
     );
 
     res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
   } finally {
     client.release();
   }
@@ -237,16 +484,13 @@ app.delete("/blocks/:id/like", async (req, res) => {
   try {
     await client.query(`delete from block_likes where block_id = $1 and user_id = $2`, [blockId, userId]);
     res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
   } finally {
     client.release();
   }
 });
 
 /* -----------------------
-   Blocks: Save Draft / Post (explicit)
+   Blocks (create, update, remix)
 ------------------------ */
 
 /**
@@ -254,32 +498,40 @@ app.delete("/blocks/:id/like", async (req, res) => {
  * Body:
  * {
  *   ownerId,
- *   blockId? (to update an existing draft),
+ *   action: "draft" | "post",
+ *   blockId?: uuid (required if updating an existing draft),
+ *   visibility: "private"|"public"|"pinned",
  *   title?,
- *   content,
- *   visibility: "public" | "private",
- *   action: "draft" | "post"
+ *   content
  * }
  *
  * Rules:
- * - action=draft => is_posted=false, posted_at=NULL
- * - action=post  => is_posted=true,  posted_at=NOW()
- * - posted+public => appears in feed
- * - posted+private => NOT in feed; appears in user's Private tab (friends-only, later)
- * - Update-in-place: if blockId provided, must be owned by ownerId and must NOT already be posted
+ * - "draft": always stored as private + is_posted=false
+ * - "post": can be public OR private
+ *   - can_appear_in_feed = is_posted && visibility==="public"
  */
 app.post("/blocks", async (req, res) => {
   const ownerId = String(req.body?.ownerId || "").trim();
+  const action = String(req.body?.action || "").trim().toLowerCase();
   const blockId = req.body?.blockId ? String(req.body.blockId).trim() : null;
+
+  let visibility = String(req.body?.visibility || "").trim().toLowerCase();
   const title = req.body?.title ? String(req.body.title).trim() : null;
   const content = String(req.body?.content || "");
-  const visibility = String(req.body?.visibility || "").trim(); // public|private
-  const action = String(req.body?.action || "").trim(); // draft|post
 
   if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-  if (!content.trim()) return res.status(400).json({ error: "content is required" });
-  if (!["public", "private"].includes(visibility)) return res.status(400).json({ error: "visibility must be public or private" });
   if (!["draft", "post"].includes(action)) return res.status(400).json({ error: "action must be draft or post" });
+  if (!content.trim()) return res.status(400).json({ error: "content is required" });
+
+  const isPosted = action === "post";
+
+  if (action === "draft") {
+    visibility = "private";
+  } else {
+    if (!["private", "public", "pinned"].includes(visibility)) {
+      return res.status(400).json({ error: "visibility must be private, public, or pinned" });
+    }
+  }
 
   const sk = buildSkeleton(content);
   const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + content);
@@ -288,50 +540,76 @@ app.post("/blocks", async (req, res) => {
   try {
     await client.query("begin");
 
-    let id: string;
-
+    // Update existing draft if blockId is provided
     if (blockId) {
-      const cur = await client.query(
-        `select id, owner_id, is_posted from blocks where id = $1 limit 1`,
+      const existing = await client.query(
+        `select id, owner_id from blocks where id = $1 limit 1`,
         [blockId]
       );
-      if (cur.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
-      if (cur.rows[0].owner_id !== ownerId) { await client.query("rollback"); return res.status(403).json({ error: "not your block" }); }
-      if (cur.rows[0].is_posted === true) { await client.query("rollback"); return res.status(403).json({ error: "cannot edit a posted block in-place" }); }
+      if (existing.rows.length === 0) {
+        await client.query("rollback");
+        return res.status(404).json({ error: "blockId not found" });
+      }
+      if (String(existing.rows[0].owner_id) !== ownerId) {
+        await client.query("rollback");
+        return res.status(403).json({ error: "not your block" });
+      }
 
-      const posted = action === "post";
       await client.query(
         `update blocks
          set title = $2,
              content = $3,
              visibility = $4,
              is_posted = $5,
-             posted_at = case when $5 then now() else null end,
-             updated_at = now(),
-             ai_tag_suggestions = $6::jsonb
+             ai_tag_suggestions = $6::jsonb,
+             updated_at = now()
          where id = $1`,
-        [blockId, title, content, visibility, posted, JSON.stringify(suggestedTags)]
+        [blockId, title, content, visibility, isPosted, JSON.stringify(suggestedTags)]
       );
-      id = blockId;
-    } else {
-      const posted = action === "post";
-      const created = await client.query(
-        `insert into blocks (owner_id, visibility, is_posted, posted_at, title, content, ai_tag_suggestions, origin_template_block_id)
-         values ($1, $2, $3, case when $3 then now() else null end, $4, $5, $6::jsonb, null)
-         returning id`,
-        [ownerId, visibility, posted, title, content, JSON.stringify(suggestedTags)]
+
+      // new version
+      const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [blockId]);
+      const nextV = Number(v.rows[0].max_v) + 1;
+
+      await client.query(
+        `insert into block_versions (block_id, version_num, title, content, meta)
+         values ($1, $2, $3, $4, '{}'::jsonb)`,
+        [blockId, nextV, title, content]
       );
-      id = created.rows[0].id as string;
+
+      await client.query(
+        `insert into block_templates (block_id, skeleton_text, skeleton_sig, slot_count, line_count, status, updated_at)
+         values ($1, $2, $3, $4, $5, 'heuristic', now())
+         on conflict (block_id) do update set
+           skeleton_text = excluded.skeleton_text,
+           skeleton_sig  = excluded.skeleton_sig,
+           slot_count    = excluded.slot_count,
+           line_count    = excluded.line_count,
+           status        = 'heuristic',
+           updated_at    = now()`,
+        [blockId, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
+      );
+
+      await client.query("commit");
+      return res.json({ id: blockId, updated: true, suggestedTags, skeletonSig: sk.skeletonSig });
     }
 
-    // versioning: append new version for every save/post
-    const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [id]);
-    const nextV = Number(v.rows[0].max_v) + 1;
+    // Create new block
+    const created = await client.query(
+      `
+      insert into blocks (owner_id, visibility, is_posted, title, content, ai_tag_suggestions, origin_template_block_id)
+      values ($1, $2, $3, $4, $5, $6::jsonb, null)
+      returning id
+      `,
+      [ownerId, visibility, isPosted, title, content, JSON.stringify(suggestedTags)]
+    );
+
+    const newId = created.rows[0].id as string;
 
     await client.query(
       `insert into block_versions (block_id, version_num, title, content, meta)
-       values ($1, $2, $3, $4, $5)`,
-      [id, nextV, title, content, JSON.stringify({ action, visibility })]
+       values ($1, 1, $2, $3, '{}'::jsonb)`,
+      [newId, title, content]
     );
 
     await client.query(
@@ -344,18 +622,11 @@ app.post("/blocks", async (req, res) => {
          line_count    = excluded.line_count,
          status        = 'heuristic',
          updated_at    = now()`,
-      [id, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
+      [newId, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
     );
 
     await client.query("commit");
-    res.json({
-      id,
-      action,
-      visibility,
-      is_posted: action === "post",
-      suggestedTags,
-      skeletonSig: sk.skeletonSig
-    });
+    res.json({ id: newId, suggestedTags, skeletonSig: sk.skeletonSig });
   } catch (err: any) {
     console.error(err);
     try { await client.query("rollback"); } catch {}
@@ -366,89 +637,115 @@ app.post("/blocks", async (req, res) => {
 });
 
 /**
+ * GET /blocks/:id
+ * Handy debug endpoint.
+ */
+app.get("/blocks/:id", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  const client = await pool.connect();
+  try {
+    const q = await client.query(
+      `
+      select
+        b.*,
+        (select count(*)::int from block_likes bl where bl.block_id = b.id) as like_count,
+        (select count(*)::int from remix_edges re where re.parent_block_id = b.id) as remix_count
+      from blocks b
+      where b.id = $1
+      limit 1
+      `,
+      [blockId]
+    );
+    if (q.rows.length === 0) return res.status(404).json({ error: "not found" });
+    res.json(q.rows[0]);
+  } finally {
+    client.release();
+  }
+});
+
+/**
  * POST /blocks/:id/remix
- * Creates a NEW draft block and returns its id for the editor.
- * Rule: cannot remix private blocks.
- * Origin credit only comes from library templates (or inherited template origin).
+ * Rule: cannot remix private parent blocks
+ * Body: { ownerId, visibility }
+ * - Remix creates a child block, default private draft behavior via your client.
+ * - origin_template_block_id stays stable (root template).
  */
 app.post("/blocks/:id/remix", async (req, res) => {
   const parentBlockId = String(req.params.id).trim();
   const ownerId = String(req.body?.ownerId || "").trim();
+  const visibility = String(req.body?.visibility || "private").trim().toLowerCase();
+
   if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
+  if (!["private", "public", "pinned"].includes(visibility)) return res.status(400).json({ error: "invalid visibility" });
 
   const client = await pool.connect();
   try {
     await client.query("begin");
 
     const parent = await client.query(
-      `select id, title, content, visibility, origin_template_block_id
+      `select id, owner_id, title, content, visibility, origin_template_block_id
        from blocks
        where id = $1
        limit 1`,
       [parentBlockId]
     );
     if (parent.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "parent block not found" }); }
-    if (parent.rows[0].visibility !== "public") { await client.query("rollback"); return res.status(403).json({ error: "cannot remix a non-public block" }); }
 
-    const isTemplate = await client.query(
-      `select 1 from library_items where template_block_id = $1 limit 1`,
-      [parentBlockId]
-    );
-
-    const originTemplateBlockId =
-      (parent.rows[0].origin_template_block_id as string | null) ??
-      (isTemplate.rows.length > 0 ? parentBlockId : null);
-
-    const parentTitle = parent.rows[0].title as string | null;
-    const parentContent = parent.rows[0].content as string;
-
-    const sk = buildSkeleton(parentContent);
-    const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + parentContent);
-
-    // Remix creates a DRAFT (private + not posted)
-    const child = await client.query(
-      `insert into blocks (
-         owner_id,
-         visibility,
-         is_posted,
-         posted_at,
-         title,
-         content,
-         ai_tag_suggestions,
-         origin_template_block_id
-       )
-       values ($1, 'private', false, null, $2, $3, $4::jsonb, $5)
-       returning id`,
-      [ownerId, parentTitle, parentContent, JSON.stringify(suggestedTags), originTemplateBlockId]
-    );
-    const childBlockId = child.rows[0].id as string;
+    if (String(parent.rows[0].visibility) === "private") {
+      await client.query("rollback");
+      return res.status(403).json({ error: "cannot remix a private block" });
+    }
 
     const pv = await client.query(
-      `select id
+      `select id, version_num, title, content
        from block_versions
        where block_id = $1
        order by version_num desc
        limit 1`,
       [parentBlockId]
     );
+
     const parentVersionId = pv.rows.length ? (pv.rows[0].id as string) : null;
+    const parentTitle = parent.rows[0].title as string | null;
+    const parentContent = parent.rows[0].content as string;
+
+    const originTemplateBlockId =
+      (parent.rows[0].origin_template_block_id as string | null) ?? parentBlockId;
+
+    const sk = buildSkeleton(parentContent);
+    const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + parentContent);
+
+    const child = await client.query(
+      `
+      insert into blocks (
+        owner_id,
+        title,
+        content,
+        visibility,
+        is_posted,
+        parent_block_id,
+        origin_template_block_id,
+        ai_tag_suggestions
+      )
+      values ($1, $2, $3, $4, false, $5, $6, $7::jsonb)
+      returning id
+      `,
+      [ownerId, parentTitle, parentContent, visibility, parentBlockId, originTemplateBlockId, JSON.stringify(suggestedTags)]
+    );
+    const childBlockId = child.rows[0].id as string;
 
     const childV1 = await client.query(
       `insert into block_versions (block_id, version_num, title, content, meta)
        values ($1, 1, $2, $3, $4)
        returning id`,
-      [
-        childBlockId,
-        parentTitle,
-        parentContent,
-        JSON.stringify({ action: "remix", remixed_from: parentBlockId, parent_version_id: parentVersionId })
-      ]
+      [childBlockId, parentTitle, parentContent, JSON.stringify({ remixed_from: parentBlockId, parent_version_id: parentVersionId })]
     );
     const childVersionId = childV1.rows[0].id as string;
 
     await client.query(
       `insert into remix_edges (child_block_id, parent_block_id, parent_version_id)
-       values ($1, $2, $3)`,
+       values ($1, $2, $3)
+       on conflict do nothing`,
       [childBlockId, parentBlockId, parentVersionId]
     );
 
@@ -487,64 +784,168 @@ app.post("/blocks/:id/remix", async (req, res) => {
   }
 });
 
-/* -----------------------
-   Feed (public posted only)
------------------------- */
+/**
+ * PUT /blocks/:id
+ * Creates a new version + stores diff if block is a remix
+ */
+app.put("/blocks/:id", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  const title = req.body?.title ? String(req.body.title).trim() : null;
+  const content = String(req.body?.content || "");
+  if (!content.trim()) return res.status(400).json({ error: "content is required" });
 
-app.get("/feed", async (req, res) => {
-  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
-  const before = req.query.before ? String(req.query.before) : null;
+  const sk = buildSkeleton(content);
+  const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + content);
 
   const client = await pool.connect();
   try {
-    const params: any[] = [];
-    let where = `where b.is_posted = true and b.visibility = 'public'`;
+    await client.query("begin");
 
-    if (before) {
-      params.push(before);
-      where += ` and coalesce(b.posted_at, b.created_at) < $${params.length}`;
-    }
+    const current = await client.query(`select id, content from blocks where id = $1 limit 1`, [blockId]);
+    if (current.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
+    const oldContent = current.rows[0].content as string;
 
-    params.push(limit);
+    const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [blockId]);
+    const nextV = Number(v.rows[0].max_v) + 1;
 
-    const q = await client.query(
-      `
-      select
-        b.id,
-        b.owner_id,
-        b.title,
-        b.content,
-        coalesce(b.posted_at, b.created_at) as feed_time,
-        coalesce(lc.like_count, 0)::int as like_count,
-        coalesce(rc.remix_count, 0)::int as remix_count
-      from blocks b
-      left join (
-        select block_id, count(*)::int as like_count
-        from block_likes
-        group by block_id
-      ) lc on lc.block_id = b.id
-      left join (
-        select parent_block_id as block_id, count(*)::int as remix_count
-        from remix_edges
-        group by parent_block_id
-      ) rc on rc.block_id = b.id
-      ${where}
-      order by feed_time desc
-      limit $${params.length}
-      `,
-      params
+    await client.query(
+      `update blocks
+       set title = $2,
+           content = $3,
+           updated_at = now(),
+           ai_tag_suggestions = $4::jsonb
+       where id = $1`,
+      [blockId, title, content, JSON.stringify(suggestedTags)]
     );
 
-    res.json({ items: q.rows });
+    const newVersion = await client.query(
+      `insert into block_versions (block_id, version_num, title, content, meta)
+       values ($1, $2, $3, $4, '{}'::jsonb)
+       returning id`,
+      [blockId, nextV, title, content]
+    );
+    const newVersionId = newVersion.rows[0].id as string;
+
+    await client.query(
+      `insert into block_templates (block_id, skeleton_text, skeleton_sig, slot_count, line_count, status, updated_at)
+       values ($1, $2, $3, $4, $5, 'heuristic', now())
+       on conflict (block_id) do update set
+         skeleton_text = excluded.skeleton_text,
+         skeleton_sig  = excluded.skeleton_sig,
+         slot_count    = excluded.slot_count,
+         line_count    = excluded.line_count,
+         status        = 'heuristic',
+         updated_at    = now()`,
+      [blockId, sk.skeletonText, sk.skeletonSig, sk.slotCount, sk.lineCount]
+    );
+
+    const edge = await client.query(
+      `select parent_block_id, parent_version_id from remix_edges where child_block_id = $1 limit 1`,
+      [blockId]
+    );
+
+    if (edge.rows.length > 0) {
+      const parentBlockId = edge.rows[0].parent_block_id as string;
+      const parentVersionId = edge.rows[0].parent_version_id as string | null;
+
+      let parentText = oldContent;
+      if (parentVersionId) {
+        const pv = await client.query(`select content from block_versions where id = $1 limit 1`, [parentVersionId]);
+        if (pv.rows.length) parentText = pv.rows[0].content as string;
+      }
+
+      const diff = diffLines(parentText, content);
+
+      await client.query(
+        `insert into block_diffs (child_block_id, parent_block_id, child_version_id, parent_version_id, diff)
+         values ($1, $2, $3, $4, $5::jsonb)`,
+        [blockId, parentBlockId, newVersionId, parentVersionId, JSON.stringify(diff)]
+      );
+    }
+
+    await client.query("commit");
+    res.json({ ok: true, version: nextV, suggestedTags });
+  } catch (err: any) {
+    console.error(err);
+    try { await client.query("rollback"); } catch {}
+    res.status(500).json({ error: err?.message ?? "unknown" });
   } finally {
     client.release();
   }
 });
 
 /* -----------------------
-   Admin endpoints (kept)
+   Invites by handle (owner only)
 ------------------------ */
+/**
+ * POST /blocks/:id/invite
+ * Body: { ownerId, invitedHandles: ["@tom","sam"] }
+ */
+app.post("/blocks/:id/invite", async (req, res) => {
+  const blockId = String(req.params.id).trim();
+  const ownerId = String(req.body?.ownerId || "").trim();
+  const invitedHandles = Array.isArray(req.body?.invitedHandles) ? req.body.invitedHandles : null;
 
+  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
+  if (!invitedHandles || invitedHandles.length === 0) return res.status(400).json({ error: "invitedHandles is required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const b = await client.query(`select id, owner_id, visibility from blocks where id = $1 limit 1`, [blockId]);
+    if (b.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
+    if (String(b.rows[0].owner_id) !== ownerId) { await client.query("rollback"); return res.status(403).json({ error: "not your block" }); }
+    if (String(b.rows[0].visibility) !== "private") { await client.query("rollback"); return res.status(400).json({ error: "can only invite on private blocks" }); }
+
+    const handles = invitedHandles
+      .map((h: any) => String(h).trim().replace(/^@/, "").toLowerCase())
+      .filter((h: string) => h.length > 0);
+
+    const u = await client.query(
+      `select user_id as id, handle from user_profiles where lower(handle) = any($1::text[])`,
+      [handles]
+    );
+
+    let added = 0;
+    for (const row of u.rows) {
+      const uid = String(row.id);
+      if (uid === ownerId) continue;
+
+      const r = await client.query(
+        `insert into block_access (block_id, user_id, granted_by)
+         values ($1, $2, $3)
+         on conflict do nothing`,
+        [blockId, uid, ownerId]
+      );
+      if ((r.rowCount ?? 0) > 0) added += 1;
+    }
+
+    await client.query("commit");
+
+    const total = await client.query(
+      `select count(*)::int as total_with_access from block_access where block_id = $1`,
+      [blockId]
+    );
+
+    res.json({
+      ok: true,
+      added,
+      resolved: u.rows.map((r: any) => r.handle),
+      total_with_access: total.rows[0].total_with_access
+    });
+  } catch (err: any) {
+    console.error(err);
+    try { await client.query("rollback"); } catch {}
+    res.status(500).json({ error: err?.message ?? "unknown" });
+  } finally {
+    client.release();
+  }
+});
+
+/* -----------------------
+   Admin: dupes helper (kept)
+------------------------ */
 app.get("/admin/library/dupes", async (req, res) => {
   const blockId = String(req.query.blockId || "").trim();
   if (!blockId) return res.status(400).json({ error: "blockId is required" });
@@ -595,430 +996,10 @@ app.get("/admin/library/dupes", async (req, res) => {
       [sk.skeletonText]
     );
 
-    res.json({ blockId, skeletonSig: sk.skeletonSig, suggestedTags, exact: exact.rows, fuzzy: fuzzy.rows, threshold: FUZZY_DUP_THRESHOLD });
+    res.json({ blockId, skeletonSig: sk.skeletonSig, suggestedTags, exact: exact.rows, fuzzy: fuzzy.rows });
   } finally {
     client.release();
   }
 });
 
 app.listen(PORT, () => console.log(`BigBio API running on port ${PORT}`));
-
-/* -----------------------
-   Block Card
------------------------- */
-
-/**
- * GET /blocks/:id
- * Returns all data needed for the Block Card view
- */
-app.get("/blocks/:id", async (req, res) => {
-  const blockId = String(req.params.id).trim();
-  if (!blockId) return res.status(400).json({ error: "blockId is required" });
-
-  const client = await pool.connect();
-  try {
-    const q = await client.query(
-      `
-      select
-        b.id,
-        b.owner_id,
-        b.title,
-        b.content,
-        b.visibility,
-        b.is_posted,
-        b.origin_template_block_id,
-        b.created_at,
-        b.updated_at,
-        coalesce(lc.like_count, 0)::int as like_count,
-        coalesce(rc.remix_count, 0)::int as remix_count,
-        re.parent_block_id
-      from blocks b
-      left join (
-        select block_id, count(*)::int as like_count
-        from block_likes
-        group by block_id
-      ) lc on lc.block_id = b.id
-      left join (
-        select parent_block_id as block_id, count(*)::int as remix_count
-        from remix_edges
-        group by parent_block_id
-      ) rc on rc.block_id = b.id
-      left join remix_edges re
-        on re.child_block_id = b.id
-      where b.id = $1
-      limit 1
-      `,
-      [blockId]
-    );
-
-    if (q.rows.length === 0) {
-      return res.status(404).json({ error: "block not found" });
-    }
-
-    {
-  const row = q.rows[0];
-  res.json({
-    ...row,
-    can_appear_in_feed: row.is_posted === true && row.visibility === "public"
-  });
-}
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
-/* -----------------------
-   Profiles (V1)
------------------------- */
-
-// Create/update profile (handle setup + avatar/style)
-// POST /profile
-// Body: { userId, handle?, avatarUrl?, bgStyle? }
-app.post("/profile", async (req, res) => {
-  const userId = String(req.body?.userId || "").trim();
-  const handle = req.body?.handle ? String(req.body.handle).trim().replace(/^@/, "") : null;
-  const avatarUrl = req.body?.avatarUrl ? String(req.body.avatarUrl).trim() : null;
-  const bgStyle = req.body?.bgStyle ? String(req.body.bgStyle).trim() : null;
-
-  if (!userId) return res.status(400).json({ error: "userId is required" });
-
-  const client = await pool.connect();
-  try {
-    // If handle is being set, enforce minimal formatting
-    if (handle && !/^[a-zA-Z0-9_]{2,24}$/.test(handle)) {
-      return res.status(400).json({ error: "handle must be 2-24 chars of letters, numbers, underscore" });
-    }
-
-    const q = await client.query(
-      `
-      insert into user_profiles (user_id, handle, avatar_url, bg_style, updated_at)
-      values (
-        $1,
-        coalesce($2, (select handle from user_profiles where user_id = $1)),
-        coalesce($3, (select avatar_url from user_profiles where user_id = $1)),
-        coalesce($4, (select bg_style from user_profiles where user_id = $1), 'default'),
-        now()
-      )
-      on conflict (user_id) do update set
-        handle = coalesce(excluded.handle, user_profiles.handle),
-        avatar_url = coalesce(excluded.avatar_url, user_profiles.avatar_url),
-        bg_style = coalesce(excluded.bg_style, user_profiles.bg_style),
-        updated_at = now()
-      returning user_id, handle, avatar_url, bg_style
-      `,
-      [userId, handle, avatarUrl, bgStyle]
-    );
-
-    res.json(q.rows[0]);
-  } catch (err: any) {
-    // Unique handle violation => friendly message
-    if (String(err?.code) === "23505") {
-      return res.status(409).json({ error: "handle already taken" });
-    }
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
-// GET /profile/@:handle  (supports short URL patterns)
-app.get("/profile/@:handle", async (req, res) => {
-  const handle = String(req.params.handle || "").trim().replace(/^@/, "");
-  if (!handle) return res.status(400).json({ error: "handle is required" });
-
-  const client = await pool.connect();
-  try {
-    const p = await client.query(
-      `select user_id, handle, avatar_url, bg_style
-       from user_profiles
-       where handle = $1
-       limit 1`,
-      [handle]
-    );
-    if (p.rows.length === 0) return res.status(404).json({ error: "profile not found" });
-
-    const userId = p.rows[0].user_id as string;
-
-    // Total likes across the user's public posted blocks (since likes only exist there in v1)
-    const likes = await client.query(
-      `
-      select count(*)::int as total_likes
-      from block_likes bl
-      join blocks b on b.id = bl.block_id
-      where b.owner_id = $1
-        and b.is_posted = true
-        and b.visibility = 'public'
-      `,
-      [userId]
-    );
-
-    res.json({
-      ...p.rows[0],
-      total_likes: likes.rows[0].total_likes
-    });
-  } finally {
-    client.release();
-  }
-});
-
-// GET /profile/:userId/public  => public posted blocks newest-first
-app.get("/profile/:userId/public", async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
-  const before = req.query.before ? String(req.query.before) : null;
-
-  const client = await pool.connect();
-  try {
-    const params: any[] = [userId];
-    let where = `where b.owner_id = $1 and b.is_posted = true and b.visibility = 'public'`;
-
-    if (before) {
-      params.push(before);
-      where += ` and coalesce(b.posted_at, b.created_at) < $${params.length}`;
-    }
-
-    params.push(limit);
-
-    const q = await client.query(
-      `
-      select
-        b.id,
-        b.owner_id,
-        b.title,
-        b.content,
-        b.visibility,
-        b.is_posted,
-        b.is_pinned,
-        b.pinned_order,
-        coalesce(b.posted_at, b.created_at) as feed_time,
-        coalesce(lc.like_count, 0)::int as like_count,
-        coalesce(rc.remix_count, 0)::int as remix_count
-      from blocks b
-      left join (
-        select block_id, count(*)::int as like_count
-        from block_likes
-        group by block_id
-      ) lc on lc.block_id = b.id
-      left join (
-        select parent_block_id as block_id, count(*)::int as remix_count
-        from remix_edges
-        group by parent_block_id
-      ) rc on rc.block_id = b.id
-      ${where}
-      order by feed_time desc
-      limit $${params.length}
-      `,
-      params
-    );
-
-    res.json({ items: q.rows });
-  } finally {
-    client.release();
-  }
-});
-
-// GET /profile/:userId/private?viewerId=...
-// V1 rule: only owner can see private tab (friends later)
-app.get("/profile/:userId/private", async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-  const viewerId = String(req.query.viewerId || "").trim();
-  const limit = Math.min(Number(req.query.limit ?? 50) || 50, 100);
-  const before = req.query.before ? String(req.query.before) : null;
-
-  if (!viewerId) return res.status(400).json({ error: "viewerId is required" });
-  if (viewerId !== userId) return res.status(403).json({ error: "private tab not available (friends coming later)" });
-
-  const client = await pool.connect();
-  try {
-    const params: any[] = [userId];
-    let where = `where b.owner_id = $1 and b.is_posted = true and b.visibility = 'private'`;
-
-    if (before) {
-      params.push(before);
-      where += ` and coalesce(b.posted_at, b.created_at) < $${params.length}`;
-    }
-
-    params.push(limit);
-
-    const q = await client.query(
-      `
-      select
-        b.id,
-        b.owner_id,
-        b.title,
-        b.content,
-        b.visibility,
-        b.is_posted,
-        b.is_pinned,
-        b.pinned_order,
-        coalesce(b.posted_at, b.created_at) as feed_time
-      from blocks b
-      ${where}
-      order by feed_time desc
-      limit $${params.length}
-      `,
-      params
-    );
-
-    res.json({ items: q.rows });
-  } finally {
-    client.release();
-  }
-});
-
-// GET /profile/:userId/pinned?viewerId=...
-// V1 rule: pinned returns public pinned to anyone; private pinned only to owner (friends later)
-app.get("/profile/:userId/pinned", async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-  const viewerId = String(req.query.viewerId || "").trim(); // optional
-  const limit = Math.min(Number(req.query.limit ?? 200) || 200, 500);
-
-  const client = await pool.connect();
-  try {
-    const params: any[] = [userId, limit];
-
-    const q = await client.query(
-      `
-      select
-        b.id,
-        b.owner_id,
-        b.title,
-        b.content,
-        b.visibility,
-        b.is_posted,
-        b.is_pinned,
-        b.pinned_order,
-        coalesce(b.posted_at, b.created_at) as feed_time
-      from blocks b
-      where b.owner_id = $1
-        and b.is_pinned = true
-        and b.is_posted = true
-        and (
-          b.visibility = 'public'
-          or (b.visibility = 'private' and $3::text = b.owner_id::text)
-        )
-      order by
-        b.pinned_order asc nulls last,
-        feed_time desc
-      limit $2
-      `,
-      // $3 is viewerId (or empty string)
-      [userId, limit, viewerId || ""]
-    );
-
-    res.json({ items: q.rows });
-  } finally {
-    client.release();
-  }
-});
-
-/* -----------------------
-   Pin/unpin + reorder
------------------------- */
-
-// POST /blocks/:id/pin
-// Body: { ownerId, order? }
-app.post("/blocks/:id/pin", async (req, res) => {
-  const blockId = String(req.params.id).trim();
-  const ownerId = String(req.body?.ownerId || "").trim();
-  const order = req.body?.order !== undefined ? Number(req.body.order) : null;
-
-  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-
-  const client = await pool.connect();
-  try {
-    const b = await client.query(`select id, owner_id, is_posted from blocks where id = $1 limit 1`, [blockId]);
-    if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
-    if (b.rows[0].owner_id !== ownerId) return res.status(403).json({ error: "not your block" });
-    if (b.rows[0].is_posted !== true) return res.status(403).json({ error: "can only pin posted blocks" });
-
-    await client.query(
-      `update blocks
-       set is_pinned = true,
-           pinned_order = coalesce($2, pinned_order),
-           updated_at = now()
-       where id = $1`,
-      [blockId, Number.isFinite(order as any) ? order : null]
-    );
-
-    res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
-// POST /blocks/:id/unpin
-// Body: { ownerId }
-app.post("/blocks/:id/unpin", async (req, res) => {
-  const blockId = String(req.params.id).trim();
-  const ownerId = String(req.body?.ownerId || "").trim();
-  if (!ownerId) return res.status(400).json({ error: "ownerId is required" });
-
-  const client = await pool.connect();
-  try {
-    const b = await client.query(`select id, owner_id from blocks where id = $1 limit 1`, [blockId]);
-    if (b.rows.length === 0) return res.status(404).json({ error: "block not found" });
-    if (b.rows[0].owner_id !== ownerId) return res.status(403).json({ error: "not your block" });
-
-    await client.query(
-      `update blocks
-       set is_pinned = false,
-           pinned_order = null,
-           updated_at = now()
-       where id = $1`,
-      [blockId]
-    );
-
-    res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
-// POST /profile/:userId/pins/reorder
-// Body: { viewerId, orderedBlockIds: [uuid...] }
-app.post("/profile/:userId/pins/reorder", async (req, res) => {
-  const userId = String(req.params.userId || "").trim();
-  const viewerId = String(req.body?.viewerId || "").trim();
-  const orderedBlockIds = Array.isArray(req.body?.orderedBlockIds) ? req.body.orderedBlockIds : null;
-
-  if (!viewerId) return res.status(400).json({ error: "viewerId is required" });
-  if (viewerId !== userId) return res.status(403).json({ error: "not your profile" });
-  if (!orderedBlockIds || orderedBlockIds.length === 0) return res.status(400).json({ error: "orderedBlockIds is required" });
-
-  const client = await pool.connect();
-  try {
-    await client.query("begin");
-
-    // Assign pinned_order = index in array
-    for (let i = 0; i < orderedBlockIds.length; i++) {
-      const id = String(orderedBlockIds[i]).trim();
-      await client.query(
-        `update blocks
-         set pinned_order = $3, updated_at = now()
-         where id = $1 and owner_id = $2 and is_pinned = true`,
-        [id, userId, i]
-      );
-    }
-
-    await client.query("commit");
-    res.json({ ok: true });
-  } catch (err: any) {
-    console.error(err);
-    try { await client.query("rollback"); } catch {}
-    res.status(500).json({ error: err?.message ?? "unknown" });
-  } finally {
-    client.release();
-  }
-});
-
