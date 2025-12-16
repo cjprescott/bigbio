@@ -17,7 +17,11 @@ app.get("/", (_req, res) => res.json({ status: "BigBio API running" }));
 
 app.get("/health/env", (_req, res) => {
   const hasDatabaseUrl = typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.length > 0;
-  res.json({ hasDatabaseUrl, databaseUrlLength: process.env.DATABASE_URL?.length ?? 0, nodeVersion: process.version });
+  res.json({
+    hasDatabaseUrl,
+    databaseUrlLength: process.env.DATABASE_URL?.length ?? 0,
+    nodeVersion: process.version
+  });
 });
 
 app.get("/health/db", async (_req, res) => {
@@ -58,7 +62,7 @@ app.get("/library/popular", async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 30) || 30, 100);
   const client = await pool.connect();
   try {
-    // Popular = 7-day window, weighted remixes > likes.
+    // Popular = 7-day window, weighted remixes > likes (per-template stats view).
     // If empty (all zeros), fall back to all-time.
     const q1 = await client.query(
       `select * from library_template_stats
@@ -86,7 +90,7 @@ app.get("/library/trending", async (req, res) => {
   const limit = Math.min(Number(req.query.limit ?? 30) || 30, 100);
   const client = await pool.connect();
   try {
-    // Trending = 24h, only show active templates.
+    // Trending = 24h.
     // If empty (all zeros), fall back to newest.
     const q1 = await client.query(
       `select * from library_template_stats
@@ -117,7 +121,7 @@ app.get("/library/trending", async (req, res) => {
 /**
  * POST /blocks/:id/like
  * Body: { userId }
- * Only allowed if the block is public (or pinned if you later decide).
+ * Only allowed if the block is public.
  */
 app.post("/blocks/:id/like", async (req, res) => {
   const blockId = String(req.params.id).trim();
@@ -190,9 +194,10 @@ app.post("/blocks", async (req, res) => {
   try {
     await client.query("begin");
 
+    // V1: new blocks are not “template-originated” unless you later create them from a library template.
     const created = await client.query(
-      `insert into blocks (owner_id, visibility, is_posted, title, content, ai_tag_suggestions)
-       values ($1, $2, false, $3, $4, $5::jsonb)
+      `insert into blocks (owner_id, visibility, is_posted, title, content, ai_tag_suggestions, origin_template_block_id)
+       values ($1, $2, false, $3, $4, $5::jsonb, null)
        returning id`,
       [ownerId, visibility, title, content, JSON.stringify(suggestedTags)]
     );
@@ -233,6 +238,8 @@ app.post("/blocks", async (req, res) => {
  * POST /blocks/:id/remix
  * Rule: cannot remix private parent blocks
  * Body: { ownerId, visibility }
+ *
+ * IMPORTANT: Sets origin_template_block_id so template usage count works.
  */
 app.post("/blocks/:id/remix", async (req, res) => {
   const parentBlockId = String(req.params.id).trim();
@@ -246,8 +253,19 @@ app.post("/blocks/:id/remix", async (req, res) => {
   try {
     await client.query("begin");
 
-    const parent = await client.query(`select id, title, content, visibility from blocks where id = $1 limit 1`, [parentBlockId]);
-    if (parent.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "parent block not found" }); }
+    // ✅ include origin_template_block_id in the select
+    const parent = await client.query(
+      `select id, title, content, visibility, origin_template_block_id
+       from blocks
+       where id = $1
+       limit 1`,
+      [parentBlockId]
+    );
+
+    if (parent.rows.length === 0) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "parent block not found" });
+    }
 
     // Your rule: private blocks can’t be remixed
     if (parent.rows[0].visibility === "private") {
@@ -269,22 +287,53 @@ app.post("/blocks/:id/remix", async (req, res) => {
     const parentContent = parent.rows[0].content as string;
 
     const sk = buildSkeleton(parentContent);
+
+    // ✅ Stable lineage:
+    // - If parent already has an origin_template_block_id, inherit it
+    // - Else parent becomes the origin root
+    const originTemplateBlockId =
+      (parent.rows[0].origin_template_block_id as string | null) ?? parentBlockId;
+
     const suggestedTags = suggestTagsFromContent(sk.skeletonText + "\n" + parentContent);
 
     const child = await client.query(
-      `insert into blocks (owner_id, visibility, is_posted, title, content, ai_tag_suggestions)
-       values ($1, $2, false, $3, $4, $5::jsonb)
+      `insert into blocks (
+         owner_id,
+         visibility,
+         is_posted,
+         title,
+         content,
+         ai_tag_suggestions,
+         parent_block_id,
+         origin_template_block_id
+       )
+       values ($1, $2, false, $3, $4, $5::jsonb, $6, $7)
        returning id`,
-      [ownerId, visibility, parentTitle, parentContent, JSON.stringify(suggestedTags)]
+      [
+        ownerId,
+        visibility,
+        parentTitle,
+        parentContent,
+        JSON.stringify(suggestedTags),
+        parentBlockId,
+        originTemplateBlockId
+      ]
     );
+
     const childBlockId = child.rows[0].id as string;
 
     const childV1 = await client.query(
       `insert into block_versions (block_id, version_num, title, content, meta)
        values ($1, 1, $2, $3, $4)
        returning id`,
-      [childBlockId, parentTitle, parentContent, JSON.stringify({ remixed_from: parentBlockId, parent_version_id: parentVersionId })]
+      [
+        childBlockId,
+        parentTitle,
+        parentContent,
+        JSON.stringify({ remixed_from: parentBlockId, parent_version_id: parentVersionId })
+      ]
     );
+
     const childVersionId = childV1.rows[0].id as string;
 
     await client.query(
@@ -313,7 +362,12 @@ app.post("/blocks/:id/remix", async (req, res) => {
     );
 
     await client.query("commit");
-    res.json({ id: childBlockId, remixedFrom: parentBlockId, suggestedTags });
+    res.json({
+      id: childBlockId,
+      remixedFrom: parentBlockId,
+      originTemplateBlockId,
+      suggestedTags
+    });
   } catch (err: any) {
     console.error(err);
     try { await client.query("rollback"); } catch {}
@@ -342,7 +396,10 @@ app.put("/blocks/:id", async (req, res) => {
     await client.query("begin");
 
     const current = await client.query(`select id, content from blocks where id = $1 limit 1`, [blockId]);
-    if (current.rows.length === 0) { await client.query("rollback"); return res.status(404).json({ error: "block not found" }); }
+    if (current.rows.length === 0) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "block not found" });
+    }
     const oldContent = current.rows[0].content as string;
 
     const v = await client.query(`select coalesce(max(version_num), 0) as max_v from block_versions where block_id = $1`, [blockId]);
@@ -468,7 +525,14 @@ app.get("/admin/library/dupes", async (req, res) => {
       [sk.skeletonText]
     );
 
-    res.json({ blockId, skeletonSig: sk.skeletonSig, suggestedTags, exact: exact.rows, fuzzy: fuzzy.rows });
+    res.json({
+      blockId,
+      skeletonSig: sk.skeletonSig,
+      suggestedTags,
+      exact: exact.rows,
+      fuzzy: fuzzy.rows,
+      threshold: FUZZY_DUP_THRESHOLD
+    });
   } finally {
     client.release();
   }
