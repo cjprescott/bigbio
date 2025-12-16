@@ -6,6 +6,13 @@ import { suggestTagsFromContent } from "./tagSuggest.js";
 import { diffLines } from "./diff.js";
 import cors from "cors";
 
+dns.setDefaultResultOrder("ipv4first");
+
+const app = express();
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const FUZZY_DUP_THRESHOLD = 0.75;
+
+// CORS goes HERE - after app is created
 app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:3000'],
   credentials: true,
@@ -13,14 +20,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'X-User-Id', 'Authorization'],
 }));
 
-dns.setDefaultResultOrder("ipv4first");
-
-const app = express();
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
-const FUZZY_DUP_THRESHOLD = 0.75;
-
 app.use(express.json());
-
 /* -----------------------
    Auth helpers (simple)
    - For now: require X-User-Id: <uuid>
