@@ -304,10 +304,9 @@ app.post("/blocks/:id/remix", async (req, res) => {
          title,
          content,
          ai_tag_suggestions,
-         parent_block_id,
          origin_template_block_id
        )
-       values ($1, $2, false, $3, $4, $5::jsonb, $6, $7)
+       values ($1, $2, false, $3, $4, $5::jsonb, $6)
        returning id`,
       [
         ownerId,
@@ -315,7 +314,6 @@ app.post("/blocks/:id/remix", async (req, res) => {
         parentTitle,
         parentContent,
         JSON.stringify(suggestedTags),
-        parentBlockId,
         originTemplateBlockId
       ]
     );
