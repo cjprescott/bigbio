@@ -156,25 +156,31 @@ app.get("/profiles/:handle/blocks", async (req, res) => {
     const profileUserId = p.rows[0].user_id as string;
 
     if (pinned) {
-      const q = await client.query(
-  `
-  select
-    b.id,
-    b.owner_id,
-    b.title,
-    b.content,
-    b.visibility,
-    b.draft_visibility,
-    b.is_posted,
-    b.created_at,
-    b.updated_at
-  from blocks b
-  where b.owner_id = $1
-    and b.is_posted = false
-  order by b.updated_at desc nulls last, b.created_at desc
-  `,
-  [profileUserId]
-);
+      if (pinned) {
+        const q = await client.query(
+          `
+          select
+            b.id,
+            b.owner_id,
+            b.title,
+            b.content,
+            b.visibility,
+            b.is_posted,
+            b.is_pinned,
+            b.pinned_order,
+            b.created_at,
+            b.posted_at
+          from blocks b
+          where b.owner_id = $1
+            and b.is_posted = true
+            and b.is_pinned = true
+            and b.visibility = 'public'
+          order by b.pinned_order asc nulls last, b.posted_at desc nulls last, b.created_at desc
+          `,
+          [profileUserId]
+        );
+        return res.json({ items: q.rows });
+      }
       return res.json({ items: q.rows });
     }
 

@@ -8,6 +8,8 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.88.0",
+    "dotenv": "^17.2.3",
     "express": "^4.19.2",
     "pg": "^8.16.3"
   },

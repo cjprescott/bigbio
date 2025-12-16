@@ -1,0 +1,290 @@
+BigBio Backend – What We’ve Been Doing (Authoritative Summary)
+
+1. The Goal (Product + System Intent)
+
+You are building BigBio, a block-based social profile system with:
+	•	Public profile pages addressable by handle
+	•	“Blocks” as the atomic content unit
+	•	A strict separation between:
+	•	Draft blocks (never public, never indexed)
+	•	Posted blocks (public or private)
+	•	Pinned blocks as a curated, ordered subset of posted public blocks
+	•	Clear rules so drafts never leak to profile, feed, search, or pins
+	•	Simple auth via X-User-Id header (temporary, non-JWT)
+
+The MVP intent is:
+	•	Visitors see only pinned public posted blocks
+	•	Owners can see:
+	•	Their pinned public blocks
+	•	Their private blocks
+	•	Their drafts (scratchpad / dumping ground)
+	•	Drafts retain a remembered visibility preference for when they’re posted later
+
+This entire session was about locking those invariants down and making the API + DB enforce them mechanically.
+
+⸻
+
+2. Core Mental Model (This Is the Source of Truth)
+
+Block lifecycle states
+
+A block is always in exactly one of these states:
+	1.	Draft
+	•	is_posted = false
+	•	Never appears on profile
+	•	Never appears in pinned
+	•	Never appears in feed
+	•	Never appears in search
+	•	Stored only for the owner
+	•	Has draft_visibility (public/private) remembered for later
+	2.	Posted – Public
+	•	is_posted = true
+	•	visibility = ‘public’
+	•	Can appear on profile
+	•	Can be pinned
+	•	Can be liked / remixed
+	•	Can appear in search
+	3.	Posted – Private
+	•	is_posted = true
+	•	visibility = ‘private’
+	•	Only owner (or invited users later) can see
+	•	Cannot be pinned (by design)
+	•	Does not appear publicly
+
+Important invariant
+Draft ≠ private.
+Drafts are a separate state entirely.
+
+⸻
+
+3. Database Schema (What Exists Now)
+
+user_profiles
+	•	user_id (uuid, PK)
+	•	handle (text, unique, lowercase)
+	•	avatar_url (text, nullable)
+	•	bg_style (text)
+	•	created_at (timestamp)
+	•	updated_at (timestamp)
+
+blocks
+	•	id (uuid, PK)
+	•	owner_id (uuid → user_profiles.user_id)
+	•	title (text)
+	•	content (text)
+	•	visibility (text: ‘public’ | ‘private’)
+	•	draft_visibility (text: ‘public’ | ‘private’ | null)
+	•	is_posted (boolean)
+	•	posted_at (timestamp, nullable)
+	•	is_pinned (boolean)
+	•	pinned_order (integer, nullable)
+	•	created_at (timestamp)
+	•	updated_at (timestamp)
+
+Key rules enforced in queries:
+	•	Drafts: is_posted = false
+	•	Posted blocks: is_posted = true
+	•	Pinned blocks must satisfy:
+	•	is_posted = true
+	•	visibility = ‘public’
+	•	is_pinned = true
+
+follows
+	•	follower_user_id (uuid)
+	•	followee_user_id (uuid)
+	•	unique(follower_user_id, followee_user_id)
+
+block_likes
+	•	block_id (uuid)
+	•	user_id (uuid)
+
+remix_edges
+	•	parent_block_id (uuid)
+	•	child_block_id (uuid)
+
+⸻
+
+4. API Endpoints Created (Final Canon)
+
+Health & Infra
+
+GET /
+	•	Returns { status: "BigBio API running" }
+
+GET /health/env
+	•	Confirms DATABASE_URL presence
+
+GET /health/db
+	•	Confirms Postgres connectivity
+	•	Returns server IP (used to debug IPv6 / pooler issues)
+
+⸻
+
+Profiles
+
+GET /profiles/:handle
+	•	Public profile header
+	•	Returns:
+	•	user info
+	•	follower_count
+	•	following_count
+	•	total_likes
+	•	viewer_follows (if X-User-Id present)
+	•	is_owner
+
+⸻
+
+Blocks (Profile-Scoped)
+
+GET /profiles/:handle/blocks?pinned=true
+	•	Public
+	•	Returns ONLY:
+	•	is_posted = true
+	•	visibility = ‘public’
+	•	is_pinned = true
+	•	Ordered by:
+	1.	pinned_order ASC
+	2.	posted_at DESC
+	3.	created_at DESC
+	•	Same result for owner and visitors
+
+This is the only block list visible to visitors.
+
+⸻
+
+GET /profiles/:handle/blocks?drafts=true
+	•	Auth required
+	•	Owner only
+	•	Returns ONLY:
+	•	is_posted = false
+	•	Sorted by recency
+	•	No likes
+	•	No remix counts
+	•	Used to populate “Drafts” list
+	•	Pure scratchpad
+
+⸻
+
+GET /profiles/:handle/blocks?visibility=private
+	•	Auth required
+	•	Owner only
+	•	Returns:
+	•	is_posted = true
+	•	visibility = ‘private’
+	•	Not public
+	•	Later extensible to invited users
+
+⸻
+
+Blocks (Direct)
+
+GET /blocks/:blockId
+	•	Public if block is posted + public
+	•	Returns full block content
+	•	Used for:
+	•	opening block
+	•	remix entry point
+	•	block editor hydration
+
+⸻
+
+Follow System
+
+POST /profiles/:handle/follow
+	•	Auth required
+	•	Creates follow edge
+	•	Idempotent via unique constraint
+
+DELETE /profiles/:handle/follow
+	•	Auth required
+	•	Removes follow edge
+
+⸻
+
+5. What Went Wrong (Why It Felt Like Chaos)
+
+You weren’t wrong — the confusion came from three overlapping failure modes:
+
+1. Draft vs Private got conflated early
+
+That caused:
+	•	Drafts accidentally appearing as pinned
+	•	Drafts being toggled public/private incorrectly
+	•	Queries leaking blocks into profile
+
+You fixed this correctly by introducing draft_visibility.
+
+⸻
+
+2. Query corruption during incremental edits
+
+At one point:
+	•	The drafts query was spliced into the pinned query
+	•	A SQL template literal was left half-open
+	•	TypeScript compiled but runtime SQL broke
+	•	Result: syntax error at “and”
+
+This is why you saw:
+	•	40+ TS errors
+	•	SQL scanner errors in Render logs
+	•	HTML error blobs (Express default 404 / error handler)
+
+⸻
+
+3. Render + Supabase pooler confusion
+
+You were:
+	•	Correctly using Postgres (not Mongo)
+	•	Switching Supabase passwords mid-session
+	•	Debugging IPv6 vs IPv4 pooler resolution
+
+This is why:
+	•	health/db sometimes failed
+	•	connectedTo IP changed
+	•	password errors appeared intermittently
+
+By the end:
+	•	health/db = OK
+	•	queries returned correct data
+	•	pinned endpoint finally behaved correctly
+
+⸻
+
+6. Where Things Ended (Current State)
+
+✅ Working
+	•	Postgres connectivity stable
+	•	Pinned blocks endpoint returns exactly one pinned public block
+	•	Draft block no longer leaks anywhere
+	•	Build passes locally and on Render
+	•	Schema reflects intended lifecycle
+
+⚠️ Known rough edges
+	•	HTML “jumbo blob” appears on invalid routes (expected Express behavior)
+	•	No /health route (only /health/env and /health/db)
+	•	No public “all blocks” tab yet (intentional)
+	•	No pin reorder endpoint yet (future)
+
+⸻
+
+7. Strategic Truth (Straight Answer)
+
+You asked earlier whether I lost context.
+
+No — the system intent was always clear.
+What broke was mechanical integrity, not conceptual clarity.
+
+You were doing real backend work under fatigue:
+	•	live DB mutations
+	•	schema evolution
+	•	prod deploys
+	•	infra debugging
+
+That combination always feels like falling into a hole, even when you’re doing the right things.
+
+The good news:
+	•	Your mental model is correct
+	•	The architecture is sound
+	•	You now have a clean, enforceable lifecycle
+
+This is exactly where a backend should be before you stop for the day.
