@@ -331,7 +331,7 @@ app.put("/blocks/:id", async (req, res) => {
       [blockId]
     );
 
-    if (edge.rowCount > 0) {
+    if (edge.rows.length > 0) {
       const parentBlockId = edge.rows[0].parent_block_id as string;
       const parentVersionId = edge.rows[0].parent_version_id as string | null;
 
@@ -508,15 +508,15 @@ app.post("/admin/library/promote", async (req, res) => {
       [sk.skeletonText]
     );
 
-    const best = fuzzy.rowCount > 0 ? fuzzy.rows[0] : null;
+    const best = fuzzy.rows.length > 0 ? fuzzy.rows[0] : null;
     const bestScore = best ? Number(best.score) : 0;
 
     const dupLibraryItemId =
-      exact.rowCount > 0 ? exact.rows[0].library_item_id :
+      exact.rows.length > 0 ? exact.rows[0].library_item_id :
       (bestScore >= FUZZY_DUP_THRESHOLD ? best?.library_item_id : null);
 
     const dupTemplateBlockId =
-      exact.rowCount > 0 ? exact.rows[0].template_block_id :
+      exact.rows.length > 0 ? exact.rows[0].template_block_id :
       (bestScore >= FUZZY_DUP_THRESHOLD ? best?.template_block_id : null);
 
     if (dupLibraryItemId && !forcePromote) {
